@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use CaptureBridge in academic work, please cite it as below."
+title: "CaptureBridge: Hub and Android client"
+authors:
+  - family-names: "Simonlehner"
+    given-names: "Mark"
+year: 2026
+license: MIT
+abstract: "Local-network mobile motion-capture acquisition suite with a Windows desktop Hub, Android phone client, live preview, file transfer, camera metadata, and Arduino/Vicon trigger support for downstream markerless biomechanics workflows."
+keywords:
+  - biomechanics
+  - markerless motion capture
+  - mobile video
+  - pose estimation
+  - Android
+  - Python
+identifiers:
+  - type: url
+    value: "https://github.com/USTP-Biomechanics/CaptureBridge-Hub"
+    description: "CaptureBridge Hub repository"
+  - type: url
+    value: "https://github.com/USTP-Biomechanics/CaptureBridge-Android"
+    description: "CaptureBridge Android repository"

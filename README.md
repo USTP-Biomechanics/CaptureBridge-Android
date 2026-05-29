@@ -1,15 +1,25 @@
 # CaptureBridge Android
 
-CaptureBridge Android is the smartphone recording client for CaptureBridge. It
-connects to CaptureBridge Hub on a local Wi-Fi or LAN network, receives session
-names and camera settings from the Hub, records videos on the phone, and sends
-completed captures back to the Windows host on request.
+CaptureBridge is a local-network acquisition system for smartphone-based
+markerless motion-analysis workflows. CaptureBridge Android is the phone-side
+recording client: it discovers CaptureBridge Hub on a local Wi-Fi or LAN
+network, receives session names and camera settings from the Hub, records video
+on the phone, streams live preview when requested, and sends completed captures
+back to the Windows host.
 
-The app was developed for smartphone-based markerless motion-analysis
-workflows, where controlled video acquisition, camera metadata, and repeatable
-file organization matter. A typical downstream use case is processing
-smartphone videos with video-to-pose, mesh-based pose-estimation, or
-OpenSim-compatible inverse-kinematics pipelines.
+The goal is repeatable acquisition, not a locked-in analysis algorithm. The app
+stores organized phone videos and metadata that can be used downstream with
+single-camera monocular analysis, multi-camera reconstruction, video-to-pose
+workflows, mesh-based pose estimation, or OpenSim-compatible
+inverse-kinematics pipelines.
+
+## Companion Hub
+
+CaptureBridge Android is the phone-side companion to
+[USTP-Biomechanics/CaptureBridge-Hub](https://github.com/USTP-Biomechanics/CaptureBridge-Hub),
+the Windows desktop controller and transfer host. For normal lab installs, the
+Hub release ZIP includes a ready-to-install `app-release.apk`; use this Android
+repository when building or modifying the phone client.
 
 ## Main Features
 
@@ -19,6 +29,7 @@ OpenSim-compatible inverse-kinematics pipelines.
 - Android Camera2 camera capability reporting
 - Remote camera setting requests for resolution, frame rate, ISO, and shutter
   time where supported by the phone
+- Raw live preview streaming to the Hub over UDP `6101`
 - H.264 MP4 recording through Android `MediaRecorder`
 - Local capture storage before transfer
 - Per-capture metadata files:
@@ -36,6 +47,8 @@ OpenSim-compatible inverse-kinematics pipelines.
 - CaptureBridge Hub running on a Windows computer
 - Phone and Windows computer on the same private Wi-Fi or LAN
 - Local network access to TCP/UDP port `6000`
+- For live preview, outbound UDP from the phone to the Hub stream port, `6101`
+  by default
 
 High frame rates depend on the phone. The app reports available modes through
 Camera2, and the Hub should choose a mode supported by all connected phones.
@@ -91,6 +104,7 @@ private storage and are transferred only when the Hub sends a transfer command.
 8. Press `START` in the Hub to begin recording on all connected phones.
 9. Press `STOP` in the Hub to end recording.
 10. Transfer the current capture or all captures from the Hub.
+11. Use the Hub's stream checkboxes when live phone preview is needed.
 
 The Android screen shows connection state, recording state, the active capture
 label, camera settings, and transfer state.
@@ -127,6 +141,8 @@ Supported Hub commands include:
 - `GET_ALL`
 - `DELETE <capture_name>`
 - `DELETE_ALL`
+- `LIVE_PREVIEW_START <json>`
+- `LIVE_PREVIEW_STOP`
 
 Common Android responses include:
 
@@ -148,6 +164,7 @@ Common Android responses include:
 - `DELETE_ERR <capture_name|ALL> <reason>`
 - `BUSY <reason>`
 - `ERR_UNKNOWN <command>`
+- `LIVE_PREVIEW_STATE <json|text>`
 
 ## Capture Output
 
@@ -191,6 +208,12 @@ validate timing with an external optical or electronic reference.
 - Manual ISO or shutter control depends on the phone's Camera2 capabilities.
 - Stop recording before switching camera or changing settings.
 
+### Live preview does not show in the Hub
+
+- Confirm the Windows firewall allows inbound UDP `6101`.
+- Confirm the phone and PC are still on the same private network.
+- Reduce preview size or FPS in the Hub if the network is congested.
+
 ### Transfer is blocked
 
 The app returns `BUSY` when it is recording, warming up the camera, or already
@@ -204,6 +227,7 @@ app/src/main/java/com/marksimonlehner/capturebridge/
   MainActivity.kt              Android UI and Hub command handling
   TcpController.kt             UDP discovery, TCP connection, and file transfer
   CaptureCameraController.kt   Camera2, MediaRecorder, capture storage, metadata
+  PhoneLivePreviewStreamer.kt  UDP JPEG live preview stream
 app/src/main/AndroidManifest.xml
 gradle/libs.versions.toml
 build.gradle.kts
@@ -212,12 +236,17 @@ settings.gradle.kts
 
 ## Citation
 
-If you use CaptureBridge in research, please cite the SoftwareX article after
-publication.
+If you use CaptureBridge in academic work, please cite the shared software
+citation:
 
 ```text
-Citation information will be added after publication.
+Simonlehner, M. (2026). CaptureBridge: Hub and Android client [Computer software suite].
+https://github.com/USTP-Biomechanics/CaptureBridge-Hub
+https://github.com/USTP-Biomechanics/CaptureBridge-Android
 ```
+
+The repository also includes the shared [CITATION.cff](CITATION.cff), which
+GitHub uses for the `Cite this repository` button.
 
 ## License
 
