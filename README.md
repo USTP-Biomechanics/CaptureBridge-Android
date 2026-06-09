@@ -87,11 +87,17 @@ creates or updates the matching GitHub Release and uploads
 
 Release-signed APKs require an Android signing configuration and signing
 secrets, so the repository workflow intentionally publishes a debug APK for
-reproducible review builds.
+reproducible review builds. This debug APK is not the official install APK for
+normal lab use.
 
 ## Installation
 
-Install the APK on each Android phone that should participate in a
+For normal lab use, install the ready-to-install `app-release.apk` bundled in
+the CaptureBridge Hub portable release. If you build from this Android
+repository, use the debug APK for development or review testing only, or
+configure Android release signing to produce a signed release APK.
+
+Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.
 The app also needs local network access so it can discover and connect to the
 Hub.
