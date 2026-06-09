@@ -5,6 +5,8 @@ authors:
   - family-names: "Simonlehner"
     given-names: "Mark"
 year: 2026
+version: "1.0.3"
+date-released: 2026-06-09
 license: MIT
 abstract: "Local-network mobile motion-capture acquisition suite with a Windows desktop Hub, Android phone client, live preview, file transfer, camera metadata, and Arduino/Vicon trigger support for downstream markerless biomechanics workflows."
 keywords:

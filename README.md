@@ -43,7 +43,9 @@ repository when building or modifying the phone client.
 ## Requirements
 
 - Android device with camera hardware
-- Android SDK 24 or newer
+- Android 7.0 / API 24 or newer on the device
+- For building from source: Android SDK Platform 36.1 and Android SDK
+  Build-Tools 36.1.0
 - CaptureBridge Hub running on a Windows computer
 - Phone and Windows computer on the same private Wi-Fi or LAN
 - Local network access to TCP/UDP port `6000`
@@ -66,7 +68,7 @@ Open the project in Android Studio, or build from the command line:
 The debug APK is written to:
 
 ```text
-app/build/outputs/apk/debug/
+build/outputs/apk/debug/
 ```
 
 For a release build, configure Android signing in the normal Android Gradle
@@ -75,6 +77,17 @@ workflow and run:
 ```powershell
 .\gradlew.bat assembleRelease
 ```
+
+### GitHub Tag Build
+
+The GitHub Actions workflow in `.github/workflows/android-apk.yml` builds a
+debug APK on `v*` tags or manual runs. When a tag is available, the workflow
+creates or updates the matching GitHub Release and uploads
+`CaptureBridge-Android-debug.apk`.
+
+Release-signed APKs require an Android signing configuration and signing
+secrets, so the repository workflow intentionally publishes a debug APK for
+reproducible review builds.
 
 ## Installation
 
@@ -222,13 +235,17 @@ before requesting another transfer or delete action.
 
 ## Repository Layout
 
+The repository keeps Android source under [src/](src/) for SoftwareX submission
+compatibility. The root Gradle project is the Android application.
+
 ```text
-app/src/main/java/com/marksimonlehner/capturebridge/
+src/main/java/com/marksimonlehner/capturebridge/
   MainActivity.kt              Android UI and Hub command handling
   TcpController.kt             UDP discovery, TCP connection, and file transfer
   CaptureCameraController.kt   Camera2, MediaRecorder, capture storage, metadata
   PhoneLivePreviewStreamer.kt  UDP JPEG live preview stream
-app/src/main/AndroidManifest.xml
+src/main/AndroidManifest.xml
+proguard-rules.pro
 gradle/libs.versions.toml
 build.gradle.kts
 settings.gradle.kts
