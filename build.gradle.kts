@@ -21,11 +21,12 @@ val releaseStoreFile = signingValue("ANDROID_KEYSTORE_FILE")
 val releaseStorePassword = signingValue("ANDROID_KEYSTORE_PASSWORD")
 val releaseKeyAlias = signingValue("ANDROID_KEY_ALIAS")
 val releaseKeyPassword = signingValue("ANDROID_KEY_PASSWORD")
+    .takeUnless { it.isNullOrBlank() }
+    ?: releaseStorePassword
 val hasReleaseSigning = listOf(
     releaseStoreFile,
     releaseStorePassword,
     releaseKeyAlias,
-    releaseKeyPassword,
 ).all { !it.isNullOrBlank() }
 
 android {
@@ -40,8 +41,8 @@ android {
         applicationId = "com.marksimonlehner.capturebridge"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.0.5"
+        versionCode = 6
+        versionName = "1.0.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
