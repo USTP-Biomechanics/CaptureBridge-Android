@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.marksimonlehner.capturebridge.ui.theme.CaptureBridgeTheme
+import org.json.JSONObject
 
 private const val SERVER_PORT = 6000
 
@@ -358,6 +359,7 @@ private fun handleTcpCommand(
         }
         "PREPARE", "ARM" -> {
             setStatus("Received $head")
+            parsePrerollMs(payload)?.let { cameraController.setPrerollFromTCP(it) }
             cameraController.prepareForRecording { response ->
                 tcpController.sendLine(response)
             }
@@ -453,6 +455,22 @@ private fun handleTcpCommand(
             setStatus("Unknown command: $trimmed")
             tcpController.send("ERR_UNKNOWN $trimmed")
         }
+    }
+}
+
+private fun parsePrerollMs(payload: String): Long? {
+    val text = payload.trim()
+    if (text.isEmpty()) {
+        return null
+    }
+    return try {
+        if (text.startsWith("{")) {
+            JSONObject(text).optLong("prerollMs", -1L).takeIf { it >= 0L }
+        } else {
+            text.toLongOrNull()
+        }
+    } catch (_: Exception) {
+        null
     }
 }
 

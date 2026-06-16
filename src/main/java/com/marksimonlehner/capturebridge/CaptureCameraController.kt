@@ -16,7 +16,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.media.AudioManager
 import android.media.ImageReader
-import android.media.MediaRecorder
+import android.media.MediaCodec
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
@@ -86,7 +86,8 @@ private data class ArmedCapture(
     val videoFile: File,
     val intrinsicsFile: File,
     val stateFile: File,
-    val recorder: MediaRecorder,
+    val encoder: RollingVideoEncoder,
+    val encoderSurface: Surface,
     val intrinsicCalibration: FloatArray?
 )
 
@@ -97,7 +98,6 @@ class CaptureCameraController(private val context: Context) {
     private val transferring = AtomicBoolean(false)
     private val warmingUp = AtomicBoolean(false)
     private val highSpeedPrearmGeneration = AtomicInteger(0)
-    private val startAckGeneration = AtomicInteger(0)
     private val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
     private val characteristicsCache = mutableMapOf<String, CameraCharacteristics>()
 
@@ -120,13 +120,14 @@ class CaptureCameraController(private val context: Context) {
     private var previewResolution = ResolutionOption(1280, 720, 30)
     private var targetIso = 2000
     private var targetShutterSeconds = 1.0 / 1000.0
+    private var prerollMs = 1000L
     private var captureLabel = ""
 
     @Volatile
     private var recording = false
 
     private var armedCapture: ArmedCapture? = null
-    private var mediaRecorder: MediaRecorder? = null
+    private var activeEncoder: RollingVideoEncoder? = null
     private var captureDir: File? = null
     private var currentBase: String? = null
     private var pendingStopDate: Date? = null
@@ -135,7 +136,6 @@ class CaptureCameraController(private val context: Context) {
     private var activeIntrinsicCalibration: FloatArray? = null
     private var frameIndex = 0
     private var firstSensorTimestampNs: Long? = null
-    private var pendingStartAck: ((String) -> Unit)? = null
 
     private val textureListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -163,11 +163,7 @@ class CaptureCameraController(private val context: Context) {
             result: android.hardware.camera2.TotalCaptureResult
         ) {
             if (recording) {
-                val hadFirstFrame = firstSensorTimestampNs != null
                 appendIntrinsics(result)
-                if (!hadFirstFrame && firstSensorTimestampNs != null) {
-                    completePendingStartAck("START_OK")
-                }
             }
         }
     }
@@ -309,6 +305,19 @@ class CaptureCameraController(private val context: Context) {
     fun setCaptureLabelFromTCP(raw: String) {
         captureLabel = sanitizeLabel(raw)
         _uiState.update { it.copy(captureLabel = captureLabel) }
+    }
+
+    fun setPrerollFromTCP(rawMs: Long) {
+        val clamped = rawMs.coerceIn(0L, 5000L)
+        if (clamped == prerollMs) {
+            return
+        }
+        prerollMs = clamped
+        backgroundHandler?.post {
+            if (!recording && cameraDevice != null) {
+                recreateIdleSession(clearArm = true)
+            }
+        }
     }
 
     fun startRecording(completion: (String) -> Unit = {}) {
@@ -674,7 +683,7 @@ class CaptureCameraController(private val context: Context) {
         val outputs = buildList {
             add(surface)
             livePreviewSurface?.let { add(it) }
-            armed?.let { add(it.recorder.surface) }
+            armed?.let { add(it.encoderSurface) }
         }
         val template = if (armed != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val useHighSpeedSession = armed != null && livePreviewSurface == null && isSelectedHighSpeedMode()
@@ -694,7 +703,7 @@ class CaptureCameraController(private val context: Context) {
                             val request = device.createCaptureRequest(template).apply {
                                 addTarget(surface)
                                 livePreviewSurface?.let { addTarget(it) }
-                                armed?.let { addTarget(it.recorder.surface) }
+                                armed?.let { addTarget(it.encoderSurface) }
                                 applyCameraRequestSettings(this, useHighSpeedSession = useHighSpeedSession)
                             }.build()
                             if (useHighSpeedSession) {
@@ -768,14 +777,14 @@ class CaptureCameraController(private val context: Context) {
         ensureIdleSessionArmed { armedReady ->
             if (!armedReady || recording) {
                 warmingUp.set(false)
-                completion(if (recording) "START_OK ALREADY_RECORDING" else "START_ERR RECORDER_NOT_ARMED")
+                completion(if (recording) "START_OK ALREADY_RECORDING" else "START_ERR ENCODER_NOT_ARMED")
                 return@ensureIdleSessionArmed
             }
 
             val armed = armedCapture ?: run {
                 warmingUp.set(false)
-                setError("Recorder not ready")
-                completion("START_ERR RECORDER_NOT_READY")
+                setError("Encoder not ready")
+                completion("START_ERR ENCODER_NOT_READY")
                 return@ensureIdleSessionArmed
             }
 
@@ -785,20 +794,19 @@ class CaptureCameraController(private val context: Context) {
             pendingStopLabel = null
             captureDir = armed.dir
             currentBase = armed.base
-            mediaRecorder = armed.recorder
+            activeEncoder = armed.encoder
             armedCapture = null
 
             try {
                 openIntrinsicsCsv(armed.intrinsicsFile)
                 writeStateJson(armed.stateFile, id, captureLabel)
                 activeIntrinsicCalibration = armed.intrinsicCalibration
-                mediaRecorder?.start()
+                activeEncoder?.beginSegment()
                 warmingUp.set(false)
                 recording = true
-                pendingStartAck = completion
-                schedulePendingStartAckFallback()
                 _uiState.update { it.copy(isRecording = true, lastError = null) }
                 playTone(ToneGenerator.TONE_PROP_ACK)
+                completion("START_OK ROLLING_BUFFER")
             } catch (error: Exception) {
                 warmingUp.set(false)
                 setError(error.message ?: "Recording failed")
@@ -814,12 +822,13 @@ class CaptureCameraController(private val context: Context) {
             completion("PREPARE_OK RECORDING")
             return
         }
-        if (captureSessionArmed && armedCapture != null) {
-            completion("PREPARE_OK READY")
+        if (captureSessionArmed && armedCapture != null && waitForRollingEncoderReady(armedCapture)) {
+            completion("PREPARE_OK READY preroll_ms=$prerollMs")
             return
         }
         ensureIdleSessionArmed { armedReady ->
-            completion(if (armedReady) "PREPARE_OK READY" else "PREPARE_ERR RECORDER_NOT_ARMED")
+            val ready = armedReady && waitForRollingEncoderReady(armedCapture)
+            completion(if (ready) "PREPARE_OK READY preroll_ms=$prerollMs" else "PREPARE_ERR ENCODER_NOT_READY")
         }
     }
 
@@ -829,12 +838,30 @@ class CaptureCameraController(private val context: Context) {
             return
         }
         cancelHighSpeedPrearm()
-        completePendingStartAck("START_OK STOP_BEFORE_FIRST_FRAME")
         pendingStopDate = Date()
         pendingStopLabel = captureLabel
         recording = false
         _uiState.update { it.copy(isRecording = false) }
         playTone(ToneGenerator.TONE_PROP_BEEP)
+
+        val encoder = activeEncoder
+        activeEncoder = null
+        val videoFile = captureDir?.let { dir ->
+            currentBase?.let { base -> File(dir, "$base.mp4") }
+        }
+        var stopError: String? = null
+        try {
+            encoder?.endSegment()
+            if (encoder != null && videoFile != null) {
+                val segment = encoder.finishSegment(videoFile)
+                writeSegmentJson(segment, File(videoFile.parentFile, "${videoFile.nameWithoutExtension}.segment.json"))
+            } else {
+                stopError = "Encoder was not active"
+            }
+        } catch (error: Exception) {
+            stopError = error.message ?: "Recording could not be finalized"
+            setError(stopError)
+        }
 
         try {
             captureSession?.stopRepeating()
@@ -843,30 +870,25 @@ class CaptureCameraController(private val context: Context) {
             // The session may already be closed by the camera service.
         }
 
-        val recorder = mediaRecorder
-        mediaRecorder = null
-        var stopError: String? = null
         try {
-            recorder?.stop()
-        } catch (error: RuntimeException) {
-            stopError = error.message ?: "Recording was too short to finalize cleanly"
-            setError(stopError)
-        } finally {
-            recorder?.reset()
-            recorder?.release()
+            encoder?.stop()
+        } catch (_: Exception) {
         }
 
         closeIntrinsicsCsv()
         activeIntrinsicCalibration = null
         finalizeCaptureNames()
+        if (stopError == null) {
+            completion("STOP_OK MEDIACODEC_MUXED")
+        } else {
+            completion("STOP_ERR ${formatProtocolError(stopError)}")
+        }
         recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
             if (success && selectedResolution.highSpeed) {
                 scheduleHighSpeedPrearm(delayMs = 100L)
             }
-            if (stopError == null) {
-                completion("STOP_OK")
-            } else {
-                completion("STOP_ERR ${formatProtocolError(stopError)}")
+            if (!success) {
+                setError("Preview rearm failed after stop")
             }
         }
     }
@@ -876,11 +898,10 @@ class CaptureCameraController(private val context: Context) {
         recording = false
         _uiState.update { it.copy(isRecording = false) }
         try {
-            mediaRecorder?.reset()
+            activeEncoder?.stop()
         } catch (_: Exception) {
         }
-        mediaRecorder?.release()
-        mediaRecorder = null
+        activeEncoder = null
         closeIntrinsicsCsv()
         activeIntrinsicCalibration = null
         captureDir?.deleteRecursively()
@@ -895,8 +916,8 @@ class CaptureCameraController(private val context: Context) {
         cameraDevice = null
         cameraId = null
         discardArmedCapture()
-        mediaRecorder?.release()
-        mediaRecorder = null
+        activeEncoder?.stop()
+        activeEncoder = null
         closeLivePreviewReader()
         previewSurface?.release()
         previewSurface = null
@@ -945,28 +966,21 @@ class CaptureCameraController(private val context: Context) {
         livePreviewReader = null
     }
 
-    @Suppress("DEPRECATION")
-    private fun createMediaRecorder(videoFile: File): MediaRecorder {
+    private fun createRollingVideoEncoder(): RollingVideoEncoder {
         val fps = selectedResolution.maxFps.coerceAtLeast(1)
         val bitRate = (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.08)
             .toLong()
             .coerceIn(8_000_000L, 80_000_000L)
             .toInt()
-
-        return MediaRecorder().apply {
-            setVideoSource(MediaRecorder.VideoSource.SURFACE)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setOutputFile(videoFile.absolutePath)
-            setVideoEncodingBitRate(bitRate)
-            setVideoFrameRate(fps)
-            if (selectedResolution.highSpeed) {
-                setCaptureRate(fps.toDouble())
-            }
-            setVideoSize(selectedResolution.width, selectedResolution.height)
-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            setOrientationHint(orientationHint())
-            prepare()
-        }
+        return RollingVideoEncoder(
+            width = selectedResolution.width,
+            height = selectedResolution.height,
+            fps = fps,
+            bitRate = bitRate,
+            orientationDegrees = orientationHint(),
+            prerollMs = prerollMs,
+            tempDir = appContext.cacheDir
+        )
     }
 
     private fun applyCameraRequestSettings(
@@ -1082,6 +1096,8 @@ class CaptureCameraController(private val context: Context) {
             .put("active_max_frame_duration", 1.0 / selectedResolution.maxFps.coerceAtLeast(1))
             .put("target_shutter_seconds", targetShutterSeconds)
             .put("target_iso", targetIso)
+            .put("recording_backend", "mediacodec_rolling_buffer")
+            .put("preroll_ms", prerollMs)
             .put("manual_sensor_supported", supportsManualSensor(id))
             .put("disable_video_stabilization", true)
             .put("orientation", "portrait")
@@ -1090,6 +1106,22 @@ class CaptureCameraController(private val context: Context) {
         characteristics.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)?.let { k ->
             payload.put("intrinsic_calibration", JSONArray(k.toList()))
         }
+        file.writeText(payload.toString(2), Charsets.UTF_8)
+    }
+
+    private fun writeSegmentJson(result: RollingVideoSegmentResult, file: File) {
+        val payload = JSONObject()
+            .put("backend", "mediacodec_rolling_buffer")
+            .put("preroll_ms", result.prerollMs)
+            .put("sample_count", result.sampleCount)
+            .put("requested_start_us", result.requestedStartUs)
+            .put("requested_end_us", result.requestedEndUs)
+            .put("muxed_start_us", result.muxedStartUs)
+            .put("muxed_end_us", result.muxedEndUs)
+            .put("first_presentation_us", result.firstPresentationUs)
+            .put("last_presentation_us", result.lastPresentationUs)
+            .put("start_offset_error_us", result.muxedStartUs - result.requestedStartUs)
+            .put("end_offset_error_us", result.muxedEndUs - result.requestedEndUs)
         file.writeText(payload.toString(2), Charsets.UTF_8)
     }
 
@@ -1120,7 +1152,7 @@ class CaptureCameraController(private val context: Context) {
             return
         }
 
-        listOf("mp4", "intrinsics.csv", "state.json").forEach { suffix ->
+        listOf("mp4", "intrinsics.csv", "state.json", "segment.json").forEach { suffix ->
             val oldFile = File(newDir, "$oldBase.$suffix")
             if (oldFile.exists()) {
                 oldFile.renameTo(File(newDir, "$newBase.$suffix"))
@@ -1244,7 +1276,7 @@ class CaptureCameraController(private val context: Context) {
         val maxAeFps = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
             ?.maxOfOrNull { it.upper }
             ?: 30
-        val sizes = map.getOutputSizes(MediaRecorder::class.java)
+        val sizes = map.getOutputSizes(MediaCodec::class.java)
             ?: map.getOutputSizes(SurfaceTexture::class.java)
             ?: emptyArray()
 
@@ -1458,23 +1490,6 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    private fun schedulePendingStartAckFallback(timeoutMs: Long = 750L) {
-        val handler = backgroundHandler ?: return
-        val generation = startAckGeneration.incrementAndGet()
-        handler.postDelayed({
-            if (generation == startAckGeneration.get() && pendingStartAck != null) {
-                completePendingStartAck("START_OK RECORDER_STARTED_NO_FRAME")
-            }
-        }, timeoutMs)
-    }
-
-    private fun completePendingStartAck(message: String) {
-        val completion = pendingStartAck ?: return
-        pendingStartAck = null
-        startAckGeneration.incrementAndGet()
-        completion(message)
-    }
-
     private fun formatProtocolError(message: String?): String {
         return (message ?: "UNKNOWN")
             .replace(Regex("\\s+"), "_")
@@ -1497,6 +1512,18 @@ class CaptureCameraController(private val context: Context) {
             return
         }
         recreateIdleSession(clearArm = true, forceArm = true, onConfigured = onReady)
+    }
+
+    private fun waitForRollingEncoderReady(armed: ArmedCapture?, timeoutMs: Long = 1200L): Boolean {
+        val encoder = armed?.encoder ?: return false
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (System.nanoTime() < deadline) {
+            if (encoder.isReady()) {
+                return true
+            }
+            Thread.sleep(20L)
+        }
+        return encoder.isReady()
     }
 
     private fun cancelHighSpeedPrearm() {
@@ -1529,11 +1556,19 @@ class CaptureCameraController(private val context: Context) {
         val intrinsicsFile = File(dir, "$base.intrinsics.csv")
         val stateFile = File(dir, "$base.state.json")
 
-        val recorder = try {
-            createMediaRecorder(videoFile)
+        val encoder = try {
+            createRollingVideoEncoder()
         } catch (error: Exception) {
             dir.deleteRecursively()
-            setError(error.message ?: "Recorder setup failed")
+            setError(error.message ?: "Encoder setup failed")
+            return null
+        }
+        val encoderSurface = try {
+            encoder.start()
+        } catch (error: Exception) {
+            encoder.stop()
+            dir.deleteRecursively()
+            setError(error.message ?: "Encoder start failed")
             return null
         }
 
@@ -1543,7 +1578,8 @@ class CaptureCameraController(private val context: Context) {
             videoFile = videoFile,
             intrinsicsFile = intrinsicsFile,
             stateFile = stateFile,
-            recorder = recorder,
+            encoder = encoder,
+            encoderSurface = encoderSurface,
             intrinsicCalibration = cameraCharacteristics(id).get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
         ).also { armedCapture = it }
     }
@@ -1552,10 +1588,9 @@ class CaptureCameraController(private val context: Context) {
         val armed = armedCapture ?: return
         armedCapture = null
         try {
-            armed.recorder.reset()
+            armed.encoder.stop()
         } catch (_: Exception) {
         }
-        armed.recorder.release()
         if (deleteFiles) {
             armed.dir.deleteRecursively()
         }
