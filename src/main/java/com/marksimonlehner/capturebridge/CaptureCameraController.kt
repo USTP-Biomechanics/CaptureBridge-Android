@@ -320,6 +320,15 @@ class CaptureCameraController(private val context: Context) {
         handler.post { startRecordingInternal(completion) }
     }
 
+    fun prepareForRecording(completion: (String) -> Unit = {}) {
+        val handler = backgroundHandler
+        if (handler == null) {
+            completion("PREPARE_ERR NO_CAMERA_THREAD")
+            return
+        }
+        handler.post { prepareForRecordingInternal(completion) }
+    }
+
     fun stopRecording(completion: (String) -> Unit = {}) {
         val handler = backgroundHandler
         if (handler == null) {
@@ -797,6 +806,20 @@ class CaptureCameraController(private val context: Context) {
                 recreateIdleSession(clearArm = true)
                 completion("START_ERR ${formatProtocolError(error.message ?: "RECORDING_FAILED")}")
             }
+        }
+    }
+
+    private fun prepareForRecordingInternal(completion: (String) -> Unit = {}) {
+        if (recording) {
+            completion("PREPARE_OK RECORDING")
+            return
+        }
+        if (captureSessionArmed && armedCapture != null) {
+            completion("PREPARE_OK READY")
+            return
+        }
+        ensureIdleSessionArmed { armedReady ->
+            completion(if (armedReady) "PREPARE_OK READY" else "PREPARE_ERR RECORDER_NOT_ARMED")
         }
     }
 

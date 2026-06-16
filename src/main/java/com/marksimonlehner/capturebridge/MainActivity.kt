@@ -354,6 +354,13 @@ private fun handleTcpCommand(
             setStatus("Received NAME $payload")
             cameraController.setCaptureLabelFromTCP(payload)
             tcpController.send("NAME_OK")
+            cameraController.prepareForRecording()
+        }
+        "PREPARE", "ARM" -> {
+            setStatus("Received $head")
+            cameraController.prepareForRecording { response ->
+                tcpController.sendLine(response)
+            }
         }
         "START" -> {
             setStatus("Received START")
