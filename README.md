@@ -59,43 +59,33 @@ The workflow has been used mostly with `1920 x 1080` recordings at up to
 
 ## Build From Source
 
-Open the project in Android Studio, or build from the command line:
-
-```powershell
-.\gradlew.bat assembleDebug
-```
-
-The debug APK is written to:
-
-```text
-build/outputs/apk/debug/
-```
-
-For a release build, configure Android signing in the normal Android Gradle
-workflow and run:
+Open the project in Android Studio, or build the signed APK from the command line:
 
 ```powershell
 .\gradlew.bat assembleRelease
 ```
 
+The release APK is written to:
+
+```text
+build/outputs/apk/release/
+```
+
+Release builds require the repository signing configuration used by the normal
+Android Gradle workflow.
+
 ### GitHub Tag Build
 
-The GitHub Actions workflow in `.github/workflows/android-apk.yml` builds a
-debug APK on `v*` tags or manual runs. When a tag is available, the workflow
-creates or updates the matching GitHub Release and uploads
-`CaptureBridge-Android-debug.apk`.
-
-Release-signed APKs require an Android signing configuration and signing
-secrets, so the repository workflow intentionally publishes a debug APK for
-reproducible review builds. This debug APK is not the official install APK for
-normal lab use.
+The GitHub Actions workflow in `.github/workflows/android-apk.yml` builds APKs
+on `v*` tags or manual runs. When a tag is available, the workflow creates or
+updates the matching GitHub Release and uploads `CaptureBridge-Android.apk`.
 
 ## Installation
 
 For normal lab use, install the ready-to-install `app-release.apk` bundled in
 the CaptureBridge Hub portable release. If you build from this Android
-repository, use the debug APK for development or review testing only, or
-configure Android release signing to produce a signed release APK.
+repository, use the release APK produced by the normal Gradle or GitHub Actions
+release workflow.
 
 Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.

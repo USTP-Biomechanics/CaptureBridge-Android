@@ -97,6 +97,7 @@ class CaptureCameraController(private val context: Context) {
     private val transferring = AtomicBoolean(false)
     private val warmingUp = AtomicBoolean(false)
     private val highSpeedPrearmGeneration = AtomicInteger(0)
+    private val startAckGeneration = AtomicInteger(0)
     private val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
     private val characteristicsCache = mutableMapOf<String, CameraCharacteristics>()
 
@@ -134,6 +135,7 @@ class CaptureCameraController(private val context: Context) {
     private var activeIntrinsicCalibration: FloatArray? = null
     private var frameIndex = 0
     private var firstSensorTimestampNs: Long? = null
+    private var pendingStartAck: ((String) -> Unit)? = null
 
     private val textureListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -161,7 +163,11 @@ class CaptureCameraController(private val context: Context) {
             result: android.hardware.camera2.TotalCaptureResult
         ) {
             if (recording) {
+                val hadFirstFrame = firstSensorTimestampNs != null
                 appendIntrinsics(result)
+                if (!hadFirstFrame && firstSensorTimestampNs != null) {
+                    completePendingStartAck("START_OK")
+                }
             }
         }
     }
@@ -279,7 +285,9 @@ class CaptureCameraController(private val context: Context) {
         backgroundHandler?.post {
             closeLivePreviewReader()
             if (!recording && cameraDevice != null) {
-                recreateIdleSession(clearArm = true)
+                recreateIdleSession(clearArm = true) {
+                    scheduleHighSpeedPrearm(delayMs = 100L)
+                }
             }
         }
         val state = LivePreviewState(
@@ -303,12 +311,22 @@ class CaptureCameraController(private val context: Context) {
         _uiState.update { it.copy(captureLabel = captureLabel) }
     }
 
-    fun startRecording() {
-        backgroundHandler?.post { startRecordingInternal() }
+    fun startRecording(completion: (String) -> Unit = {}) {
+        val handler = backgroundHandler
+        if (handler == null) {
+            completion("START_ERR NO_CAMERA_THREAD")
+            return
+        }
+        handler.post { startRecordingInternal(completion) }
     }
 
-    fun stopRecording() {
-        backgroundHandler?.post { stopRecordingInternal() }
+    fun stopRecording(completion: (String) -> Unit = {}) {
+        val handler = backgroundHandler
+        if (handler == null) {
+            completion("STOP_ERR NO_CAMERA_THREAD")
+            return
+        }
+        handler.post { stopRecordingInternal(completion) }
     }
 
     fun transferBusyReason(): String? {
@@ -432,7 +450,7 @@ class CaptureCameraController(private val context: Context) {
                 if (success) {
                     completion(buildCameraSettingsJSON(), null)
                     if (selectedResolution.highSpeed) {
-                        scheduleHighSpeedPrearm()
+                        scheduleHighSpeedPrearm(delayMs = 100L)
                     }
                 } else {
                     completion(null, "FORMAT_APPLY_FAILED")
@@ -557,7 +575,11 @@ class CaptureCameraController(private val context: Context) {
         }
         val view = textureView ?: return
         if (!view.isAvailable || cameraDevice != null) {
-            if (cameraDevice != null && !recording) recreateIdleSession()
+            if (cameraDevice != null && !recording) {
+                recreateIdleSession {
+                    scheduleHighSpeedPrearm(delayMs = 100L)
+                }
+            }
             return
         }
 
@@ -583,7 +605,9 @@ class CaptureCameraController(private val context: Context) {
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         cameraDevice = camera
-                        recreateIdleSession(clearArm = true)
+                        recreateIdleSession(clearArm = true) {
+                            scheduleHighSpeedPrearm(delayMs = 100L)
+                        }
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -721,20 +745,28 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    private fun startRecordingInternal() {
-        if (recording) return
-        val id = cameraId ?: return
+    private fun startRecordingInternal(completion: (String) -> Unit = {}) {
+        if (recording) {
+            completion("START_OK ALREADY_RECORDING")
+            return
+        }
+        val id = cameraId ?: run {
+            completion("START_ERR NO_CAMERA")
+            return
+        }
         cancelHighSpeedPrearm()
         warmingUp.set(true)
         ensureIdleSessionArmed { armedReady ->
             if (!armedReady || recording) {
                 warmingUp.set(false)
+                completion(if (recording) "START_OK ALREADY_RECORDING" else "START_ERR RECORDER_NOT_ARMED")
                 return@ensureIdleSessionArmed
             }
 
             val armed = armedCapture ?: run {
                 warmingUp.set(false)
                 setError("Recorder not ready")
+                completion("START_ERR RECORDER_NOT_READY")
                 return@ensureIdleSessionArmed
             }
 
@@ -754,6 +786,8 @@ class CaptureCameraController(private val context: Context) {
                 mediaRecorder?.start()
                 warmingUp.set(false)
                 recording = true
+                pendingStartAck = completion
+                schedulePendingStartAckFallback()
                 _uiState.update { it.copy(isRecording = true, lastError = null) }
                 playTone(ToneGenerator.TONE_PROP_ACK)
             } catch (error: Exception) {
@@ -761,13 +795,18 @@ class CaptureCameraController(private val context: Context) {
                 setError(error.message ?: "Recording failed")
                 cleanupFailedRecording()
                 recreateIdleSession(clearArm = true)
+                completion("START_ERR ${formatProtocolError(error.message ?: "RECORDING_FAILED")}")
             }
         }
     }
 
-    private fun stopRecordingInternal() {
-        if (!recording) return
+    private fun stopRecordingInternal(completion: (String) -> Unit = {}) {
+        if (!recording) {
+            completion("STOP_OK NOT_RECORDING")
+            return
+        }
         cancelHighSpeedPrearm()
+        completePendingStartAck("START_OK STOP_BEFORE_FIRST_FRAME")
         pendingStopDate = Date()
         pendingStopLabel = captureLabel
         recording = false
@@ -783,10 +822,12 @@ class CaptureCameraController(private val context: Context) {
 
         val recorder = mediaRecorder
         mediaRecorder = null
+        var stopError: String? = null
         try {
             recorder?.stop()
         } catch (error: RuntimeException) {
-            setError(error.message ?: "Recording was too short to finalize cleanly")
+            stopError = error.message ?: "Recording was too short to finalize cleanly"
+            setError(stopError)
         } finally {
             recorder?.reset()
             recorder?.release()
@@ -797,7 +838,12 @@ class CaptureCameraController(private val context: Context) {
         finalizeCaptureNames()
         recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
             if (success && selectedResolution.highSpeed) {
-                scheduleHighSpeedPrearm()
+                scheduleHighSpeedPrearm(delayMs = 100L)
+            }
+            if (stopError == null) {
+                completion("STOP_OK")
+            } else {
+                completion("STOP_ERR ${formatProtocolError(stopError)}")
             }
         }
     }
@@ -1387,6 +1433,31 @@ class CaptureCameraController(private val context: Context) {
             toneGenerator.startTone(tone, 120)
         } catch (_: Exception) {
         }
+    }
+
+    private fun schedulePendingStartAckFallback(timeoutMs: Long = 750L) {
+        val handler = backgroundHandler ?: return
+        val generation = startAckGeneration.incrementAndGet()
+        handler.postDelayed({
+            if (generation == startAckGeneration.get() && pendingStartAck != null) {
+                completePendingStartAck("START_OK RECORDER_STARTED_NO_FRAME")
+            }
+        }, timeoutMs)
+    }
+
+    private fun completePendingStartAck(message: String) {
+        val completion = pendingStartAck ?: return
+        pendingStartAck = null
+        startAckGeneration.incrementAndGet()
+        completion(message)
+    }
+
+    private fun formatProtocolError(message: String?): String {
+        return (message ?: "UNKNOWN")
+            .replace(Regex("\\s+"), "_")
+            .replace(Regex("[^A-Za-z0-9_.-]"), "_")
+            .take(80)
+            .ifBlank { "UNKNOWN" }
     }
 
     private fun sanitizeLabel(value: String): String {

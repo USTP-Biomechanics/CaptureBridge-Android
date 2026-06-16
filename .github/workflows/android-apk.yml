@@ -16,8 +16,10 @@ permissions:
 
 jobs:
   apk:
-    name: Build debug APK
+    name: Build release APK
     runs-on: ubuntu-latest
+    env:
+      HAS_RELEASE_SIGNING: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
 
     steps:
       - name: Check out repository
@@ -37,21 +39,39 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           sdkmanager "platform-tools" "platforms;android-36.1" "build-tools;36.1.0"
 
-      - name: Build debug APK
+      - name: Verify release signing secrets
+        run: |
+          if [[ "$HAS_RELEASE_SIGNING" != "true" ]]; then
+            echo "::error::Release signing secrets are required to build the published APK."
+            exit 1
+          fi
+
+      - name: Prepare release signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/capturebridge-release.jks"
+
+      - name: Build signed release APK
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/capturebridge-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x ./gradlew
-          ./gradlew --no-daemon assembleDebug
+          ./gradlew --no-daemon assembleRelease
 
       - name: Prepare APK asset
         run: |
           mkdir -p release-assets
-          cp build/outputs/apk/debug/*.apk release-assets/CaptureBridge-Android-debug.apk
+          cp build/outputs/apk/release/*.apk release-assets/CaptureBridge-Android.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CaptureBridge-Android-debug-apk
-          path: release-assets/CaptureBridge-Android-debug.apk
+          name: CaptureBridge-Android-apk
+          path: release-assets/CaptureBridge-Android.apk
 
       - name: Set release tag
         shell: bash
@@ -68,5 +88,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes "CaptureBridge Android debug APK."
-          gh release upload "$RELEASE_TAG" release-assets/CaptureBridge-Android-debug.apk --clobber
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes "CaptureBridge Android APK."
+          gh release upload "$RELEASE_TAG" release-assets/CaptureBridge-Android.apk --clobber

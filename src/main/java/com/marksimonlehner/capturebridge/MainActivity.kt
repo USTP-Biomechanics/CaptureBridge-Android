@@ -357,13 +357,15 @@ private fun handleTcpCommand(
         }
         "START" -> {
             setStatus("Received START")
-            cameraController.startRecording()
-            tcpController.send("START_OK")
+            cameraController.startRecording { response ->
+                tcpController.sendLine(response)
+            }
         }
         "STOP" -> {
             setStatus("Received STOP")
-            cameraController.stopRecording()
-            tcpController.send("STOP_OK")
+            cameraController.stopRecording { response ->
+                tcpController.sendLine(response)
+            }
         }
         "LIST" -> {
             tcpController.sendLine("LIST_OK ${cameraController.buildCaptureListJSON()}")
