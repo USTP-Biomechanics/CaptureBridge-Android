@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.TextureView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -102,7 +103,6 @@ private fun CaptureBridgeScreen(
     }
     var statusText by remember { mutableStateOf("Idle") }
     var serverIp by rememberSaveable { mutableStateOf("-") }
-    var didAutoConnect by rememberSaveable { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -141,12 +141,9 @@ private fun CaptureBridgeScreen(
     LaunchedEffect(hasCameraPermission) {
         if (hasCameraPermission) {
             cameraController.start()
-            if (!didAutoConnect) {
-                didAutoConnect = true
-                statusText = "Discovering..."
-                tcpController.discoverAndConnect(SERVER_PORT) { resolvedIp ->
-                    serverIp = resolvedIp
-                }
+            statusText = "Discovering..."
+            tcpController.discoverAndConnect(SERVER_PORT) { resolvedIp ->
+                serverIp = resolvedIp
             }
         }
     }
@@ -349,31 +346,37 @@ private fun handleTcpCommand(
     val separator = trimmed.indexOf(' ')
     val head = if (separator >= 0) trimmed.substring(0, separator) else trimmed
     val payload = if (separator >= 0) trimmed.substring(separator + 1) else ""
+    val phoneRxNs = SystemClock.elapsedRealtimeNanos()
+    val phoneRxWallNs = System.nanoTime()
 
     when (head.uppercase()) {
         "NAME" -> {
             setStatus("Received NAME $payload")
             cameraController.setCaptureLabelFromTCP(payload)
-            tcpController.send("NAME_OK")
+            tcpController.sendLine(withPhoneTiming("NAME_OK", phoneRxNs))
             cameraController.prepareForRecording()
+        }
+        "PING" -> {
+            tcpController.sendLine(withPhoneTiming("PONG $payload phone_elapsed_ns=${SystemClock.elapsedRealtimeNanos()}", phoneRxNs))
         }
         "PREPARE", "ARM" -> {
             setStatus("Received $head")
             parsePrerollMs(payload)?.let { cameraController.setPrerollFromTCP(it) }
+            parseCameraLeadMs(payload)?.let { cameraController.setCameraLeadFromTCP(it) }
             cameraController.prepareForRecording { response ->
-                tcpController.sendLine(response)
+                tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
             }
         }
         "START" -> {
             setStatus("Received START")
-            cameraController.startRecording { response ->
-                tcpController.sendLine(response)
+            cameraController.startRecording(commandReceivedWallNs = phoneRxWallNs) { response ->
+                tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
             }
         }
         "STOP" -> {
             setStatus("Received STOP")
-            cameraController.stopRecording { response ->
-                tcpController.sendLine(response)
+            cameraController.stopRecording(commandReceivedWallNs = phoneRxWallNs) { response ->
+                tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
             }
         }
         "LIST" -> {
@@ -458,6 +461,9 @@ private fun handleTcpCommand(
     }
 }
 
+private fun withPhoneTiming(response: String, phoneRxNs: Long): String =
+    "$response phone_rx_ns=$phoneRxNs phone_tx_ns=${SystemClock.elapsedRealtimeNanos()}"
+
 private fun parsePrerollMs(payload: String): Long? {
     val text = payload.trim()
     if (text.isEmpty()) {
@@ -469,6 +475,18 @@ private fun parsePrerollMs(payload: String): Long? {
         } else {
             text.toLongOrNull()
         }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun parseCameraLeadMs(payload: String): Double? {
+    val text = payload.trim()
+    if (!text.startsWith("{")) {
+        return null
+    }
+    return try {
+        JSONObject(text).optDouble("cameraLeadMs", Double.NaN).takeIf { it.isFinite() }
     } catch (_: Exception) {
         null
     }

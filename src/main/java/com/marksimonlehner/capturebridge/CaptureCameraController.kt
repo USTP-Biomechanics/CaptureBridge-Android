@@ -21,6 +21,7 @@ import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Range
 import android.util.Size
 import android.view.Surface
@@ -97,6 +98,7 @@ class CaptureCameraController(private val context: Context) {
     private val transferExecutor = Executors.newSingleThreadExecutor()
     private val transferring = AtomicBoolean(false)
     private val warmingUp = AtomicBoolean(false)
+    private val sessionGeneration = AtomicInteger(0)
     private val highSpeedPrearmGeneration = AtomicInteger(0)
     private val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
     private val characteristicsCache = mutableMapOf<String, CameraCharacteristics>()
@@ -121,12 +123,14 @@ class CaptureCameraController(private val context: Context) {
     private var targetIso = 2000
     private var targetShutterSeconds = 1.0 / 1000.0
     private var prerollMs = 1000L
+    private var cameraLeadUs = 0L
     private var captureLabel = ""
 
     @Volatile
     private var recording = false
 
     private var armedCapture: ArmedCapture? = null
+    private var lastArmFailureReason: String? = null
     private var activeEncoder: RollingVideoEncoder? = null
     private var captureDir: File? = null
     private var currentBase: String? = null
@@ -303,7 +307,7 @@ class CaptureCameraController(private val context: Context) {
     }
 
     fun setCaptureLabelFromTCP(raw: String) {
-        captureLabel = sanitizeLabel(raw)
+        captureLabel = sanitizeCaptureLabel(raw)
         _uiState.update { it.copy(captureLabel = captureLabel) }
     }
 
@@ -320,13 +324,17 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    fun startRecording(completion: (String) -> Unit = {}) {
+    fun setCameraLeadFromTCP(rawMs: Double) {
+        cameraLeadUs = (rawMs.coerceIn(0.0, 5000.0) * 1000.0).toLong()
+    }
+
+    fun startRecording(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
         val handler = backgroundHandler
         if (handler == null) {
             completion("START_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { startRecordingInternal(completion) }
+        handler.post { startRecordingInternal(commandReceivedWallNs, completion) }
     }
 
     fun prepareForRecording(completion: (String) -> Unit = {}) {
@@ -338,13 +346,13 @@ class CaptureCameraController(private val context: Context) {
         handler.post { prepareForRecordingInternal(completion) }
     }
 
-    fun stopRecording(completion: (String) -> Unit = {}) {
+    fun stopRecording(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
         val handler = backgroundHandler
         if (handler == null) {
             completion("STOP_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { stopRecordingInternal(completion) }
+        handler.post { stopRecordingInternal(commandReceivedWallNs, completion) }
     }
 
     fun transferBusyReason(): String? {
@@ -464,10 +472,15 @@ class CaptureCameraController(private val context: Context) {
             targetShutterSeconds = shutterSeconds
             publishSettings()
             cancelHighSpeedPrearm()
-            recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
+            val useHighSpeedSession = selectedResolution.highSpeed
+            recreateIdleSession(
+                clearArm = true,
+                allowArm = true,
+                forceArm = useHighSpeedSession
+            ) { success ->
                 if (success) {
                     completion(buildCameraSettingsJSON(), null)
-                    if (selectedResolution.highSpeed) {
+                    if (!useHighSpeedSession && selectedResolution.highSpeed) {
                         scheduleHighSpeedPrearm(delayMs = 100L)
                     }
                 } else {
@@ -661,7 +674,9 @@ class CaptureCameraController(private val context: Context) {
             return
         }
 
+        val generation = sessionGeneration.incrementAndGet()
         closeCaptureSession()
+        lastArmFailureReason = null
         if (clearArm) {
             discardArmedCapture()
         }
@@ -680,18 +695,32 @@ class CaptureCameraController(private val context: Context) {
         }
         val shouldPrepareArmedCapture = allowArm && (!selectedResolution.highSpeed || forceArm)
         val armed = if (shouldPrepareArmedCapture) prepareArmedCapture() else null
-        val outputs = buildList {
-            add(surface)
-            livePreviewSurface?.let { add(it) }
-            armed?.let { add(it.encoderSurface) }
+        if (shouldPrepareArmedCapture && armed == null) {
+            if (lastArmFailureReason == null) {
+                lastArmFailureReason = "ENCODER_SETUP_FAILED"
+            }
+            onConfigured?.invoke(false)
+            return
         }
         val template = if (armed != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val useHighSpeedSession = armed != null && livePreviewSurface == null && isSelectedHighSpeedMode()
+        val includePreviewSurface = true
+        val outputs = buildList {
+            if (includePreviewSurface) {
+                add(surface)
+            }
+            livePreviewSurface?.let { add(it) }
+            armed?.let { add(it.encoderSurface) }
+        }
 
         try {
             val stateCallback =
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
+                        if (generation != sessionGeneration.get()) {
+                            session.close()
+                            return
+                        }
                         if (cameraDevice == null || recording) {
                             session.close()
                             onConfigured?.invoke(false)
@@ -701,7 +730,9 @@ class CaptureCameraController(private val context: Context) {
                         captureSessionArmed = armed != null
                         try {
                             val request = device.createCaptureRequest(template).apply {
-                                addTarget(surface)
+                                if (includePreviewSurface) {
+                                    addTarget(surface)
+                                }
                                 livePreviewSurface?.let { addTarget(it) }
                                 armed?.let { addTarget(it.encoderSurface) }
                                 applyCameraRequestSettings(this, useHighSpeedSession = useHighSpeedSession)
@@ -721,25 +752,34 @@ class CaptureCameraController(private val context: Context) {
                             onConfigured?.invoke(true)
                         } catch (error: Exception) {
                             session.close()
+                            if (generation != sessionGeneration.get()) {
+                                return
+                            }
                             captureSession = null
                             captureSessionArmed = false
-                            if (armed != null && allowArm) {
+                            if (armed != null && allowArm && !forceArm) {
                                 discardArmedCapture()
                                 recreateIdleSession(allowArm = false, onConfigured = onConfigured)
                                 return
                             }
+                            lastArmFailureReason = formatProtocolError(error.message ?: "CAPTURE_SESSION_START_FAILED")
                             setError(error.message ?: "Preview failed")
                             onConfigured?.invoke(false)
                         }
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
+                        if (generation != sessionGeneration.get()) {
+                            session.close()
+                            return
+                        }
                         captureSessionArmed = false
-                        if (armed != null && allowArm) {
+                        if (armed != null && allowArm && !forceArm) {
                             discardArmedCapture()
                             recreateIdleSession(allowArm = false, onConfigured = onConfigured)
                             return
                         }
+                        lastArmFailureReason = "CAPTURE_SESSION_CONFIG_FAILED"
                         setError("Preview configuration failed")
                         onConfigured?.invoke(false)
                     }
@@ -753,17 +793,19 @@ class CaptureCameraController(private val context: Context) {
             }
         } catch (error: CameraAccessException) {
             captureSessionArmed = false
-            if (armed != null && allowArm) {
+            if (armed != null && allowArm && !forceArm) {
                 discardArmedCapture()
                 recreateIdleSession(allowArm = false, onConfigured = onConfigured)
                 return
             }
+            lastArmFailureReason = formatProtocolError(error.message ?: "CAPTURE_SESSION_CREATE_FAILED")
             setError(error.message ?: "Preview configuration failed")
             onConfigured?.invoke(false)
         }
     }
 
-    private fun startRecordingInternal(completion: (String) -> Unit = {}) {
+    private fun startRecordingInternal(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+        val requestBeginNs = SystemClock.elapsedRealtimeNanos()
         if (recording) {
             completion("START_OK ALREADY_RECORDING")
             return
@@ -801,12 +843,19 @@ class CaptureCameraController(private val context: Context) {
                 openIntrinsicsCsv(armed.intrinsicsFile)
                 writeStateJson(armed.stateFile, id, captureLabel)
                 activeIntrinsicCalibration = armed.intrinsicCalibration
-                activeEncoder?.beginSegment()
+                val requestedStartUs = activeEncoder?.beginSegment(commandReceivedWallNs, cameraLeadUs)
+                val requestMarkedNs = SystemClock.elapsedRealtimeNanos()
                 warmingUp.set(false)
                 recording = true
                 _uiState.update { it.copy(isRecording = true, lastError = null) }
                 playTone(ToneGenerator.TONE_PROP_ACK)
-                completion("START_OK ROLLING_BUFFER")
+                completion(
+                    "START_OK ROLLING_BUFFER " +
+                        "phone_start_begin_ns=$requestBeginNs " +
+                        "phone_start_marked_ns=$requestMarkedNs " +
+                        "requested_start_us=${requestedStartUs ?: -1L} " +
+                        "camera_lead_ms=${cameraLeadUs / 1000.0}"
+                )
             } catch (error: Exception) {
                 warmingUp.set(false)
                 setError(error.message ?: "Recording failed")
@@ -822,17 +871,19 @@ class CaptureCameraController(private val context: Context) {
             completion("PREPARE_OK RECORDING")
             return
         }
-        if (captureSessionArmed && armedCapture != null && waitForRollingEncoderReady(armedCapture)) {
-            completion("PREPARE_OK READY preroll_ms=$prerollMs")
-            return
-        }
-        ensureIdleSessionArmed { armedReady ->
-            val ready = armedReady && waitForRollingEncoderReady(armedCapture)
-            completion(if (ready) "PREPARE_OK READY preroll_ms=$prerollMs" else "PREPARE_ERR ENCODER_NOT_READY")
+        waitForPreparedEncoder(rearmIfNeeded = true) { ready, reason ->
+            completion(
+                if (ready) {
+                    "PREPARE_OK READY preroll_ms=$prerollMs camera_lead_ms=${cameraLeadUs / 1000.0}"
+                } else {
+                    "PREPARE_ERR $reason"
+                }
+            )
         }
     }
 
-    private fun stopRecordingInternal(completion: (String) -> Unit = {}) {
+    private fun stopRecordingInternal(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+        val requestBeginNs = SystemClock.elapsedRealtimeNanos()
         if (!recording) {
             completion("STOP_OK NOT_RECORDING")
             return
@@ -850,10 +901,15 @@ class CaptureCameraController(private val context: Context) {
             currentBase?.let { base -> File(dir, "$base.mp4") }
         }
         var stopError: String? = null
+        var requestedEndUs: Long? = null
+        var segmentMarkedNs: Long? = null
+        var muxDoneNs: Long? = null
         try {
-            encoder?.endSegment()
+            requestedEndUs = encoder?.endSegment(commandReceivedWallNs)
+            segmentMarkedNs = SystemClock.elapsedRealtimeNanos()
             if (encoder != null && videoFile != null) {
                 val segment = encoder.finishSegment(videoFile)
+                muxDoneNs = SystemClock.elapsedRealtimeNanos()
                 writeSegmentJson(segment, File(videoFile.parentFile, "${videoFile.nameWithoutExtension}.segment.json"))
             } else {
                 stopError = "Encoder was not active"
@@ -877,12 +933,23 @@ class CaptureCameraController(private val context: Context) {
 
         closeIntrinsicsCsv()
         activeIntrinsicCalibration = null
-        finalizeCaptureNames()
         if (stopError == null) {
-            completion("STOP_OK MEDIACODEC_MUXED")
+            finalizeCaptureNames()
+            completion(
+                "STOP_OK MEDIACODEC_MUXED " +
+                    "phone_stop_begin_ns=$requestBeginNs " +
+                    "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
+                    "phone_stop_mux_done_ns=${muxDoneNs ?: -1L} " +
+                    "requested_end_us=${requestedEndUs ?: -1L}"
+            )
         } else {
+            captureDir?.deleteRecursively()
             completion("STOP_ERR ${formatProtocolError(stopError)}")
         }
+        captureDir = null
+        currentBase = null
+        pendingStopDate = null
+        pendingStopLabel = null
         recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
             if (success && selectedResolution.highSpeed) {
                 scheduleHighSpeedPrearm(delayMs = 100L)
@@ -968,9 +1035,9 @@ class CaptureCameraController(private val context: Context) {
 
     private fun createRollingVideoEncoder(): RollingVideoEncoder {
         val fps = selectedResolution.maxFps.coerceAtLeast(1)
-        val bitRate = (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.08)
+        val bitRate = (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.20)
             .toLong()
-            .coerceIn(8_000_000L, 80_000_000L)
+            .coerceIn(16_000_000L, 160_000_000L)
             .toInt()
         return RollingVideoEncoder(
             width = selectedResolution.width,
@@ -979,7 +1046,8 @@ class CaptureCameraController(private val context: Context) {
             bitRate = bitRate,
             orientationDegrees = orientationHint(),
             prerollMs = prerollMs,
-            tempDir = appContext.cacheDir
+            tempDir = appContext.cacheDir,
+            useTimestampedInput = !selectedResolution.highSpeed
         )
     }
 
@@ -1113,7 +1181,10 @@ class CaptureCameraController(private val context: Context) {
         val payload = JSONObject()
             .put("backend", "mediacodec_rolling_buffer")
             .put("preroll_ms", result.prerollMs)
+            .put("camera_lead_ms", result.cameraLeadUs / 1000.0)
             .put("sample_count", result.sampleCount)
+            .put("frame_selection_policy", result.frameSelectionPolicy)
+            .put("all_intra", result.allIntra)
             .put("requested_start_us", result.requestedStartUs)
             .put("requested_end_us", result.requestedEndUs)
             .put("muxed_start_us", result.muxedStartUs)
@@ -1122,6 +1193,7 @@ class CaptureCameraController(private val context: Context) {
             .put("last_presentation_us", result.lastPresentationUs)
             .put("start_offset_error_us", result.muxedStartUs - result.requestedStartUs)
             .put("end_offset_error_us", result.muxedEndUs - result.requestedEndUs)
+            .put("timestamp_source", result.timestampSource)
         file.writeText(payload.toString(2), Charsets.UTF_8)
     }
 
@@ -1490,28 +1562,47 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    private fun formatProtocolError(message: String?): String {
-        return (message ?: "UNKNOWN")
-            .replace(Regex("\\s+"), "_")
-            .replace(Regex("[^A-Za-z0-9_.-]"), "_")
-            .take(80)
-            .ifBlank { "UNKNOWN" }
-    }
-
-    private fun sanitizeLabel(value: String): String {
-        val trimmed = value.trim()
-        if (trimmed.isEmpty()) return ""
-        return trimmed.map { char ->
-            if (char in 'A'..'Z' || char in 'a'..'z' || char in '0'..'9' || char == '_' || char == '-') char else '_'
-        }.joinToString(separator = "").take(48)
-    }
-
     private fun ensureIdleSessionArmed(onReady: (Boolean) -> Unit) {
         if (captureSessionArmed && armedCapture != null) {
             onReady(true)
             return
         }
         recreateIdleSession(clearArm = true, forceArm = true, onConfigured = onReady)
+    }
+
+    private fun waitForPreparedEncoder(
+        rearmIfNeeded: Boolean,
+        onReady: (Boolean, String) -> Unit
+    ) {
+        ensureIdleSessionArmed { armedReady ->
+            if (!armedReady || armedCapture == null) {
+                onReady(false, armFailureReason())
+                return@ensureIdleSessionArmed
+            }
+            if (waitForRollingEncoderReady(armedCapture, timeoutMs = 2500L)) {
+                onReady(true, "READY")
+                return@ensureIdleSessionArmed
+            }
+            if (!rearmIfNeeded) {
+                onReady(false, "ENCODER_NOT_READY")
+                return@ensureIdleSessionArmed
+            }
+            recreateIdleSession(clearArm = true, forceArm = true) { rearmed ->
+                val ready = rearmed && waitForRollingEncoderReady(armedCapture, timeoutMs = 2500L)
+                onReady(ready, if (ready) "READY" else armFailureReason())
+            }
+        }
+    }
+
+    private fun armFailureReason(): String {
+        return when {
+            lastArmFailureReason != null -> lastArmFailureReason ?: "ENCODER_ARM_FAILED"
+            cameraDevice == null -> "NO_CAMERA_OPEN"
+            textureView?.surfaceTexture == null -> "NO_PREVIEW_SURFACE"
+            armedCapture == null -> "ENCODER_NOT_ARMED"
+            !captureSessionArmed -> "CAPTURE_SESSION_NOT_ARMED"
+            else -> "ENCODER_NOT_READY"
+        }
     }
 
     private fun waitForRollingEncoderReady(armed: ArmedCapture?, timeoutMs: Long = 1200L): Boolean {
@@ -1560,6 +1651,7 @@ class CaptureCameraController(private val context: Context) {
             createRollingVideoEncoder()
         } catch (error: Exception) {
             dir.deleteRecursively()
+            lastArmFailureReason = formatProtocolError(error.message ?: "ENCODER_SETUP_FAILED")
             setError(error.message ?: "Encoder setup failed")
             return null
         }
@@ -1568,6 +1660,7 @@ class CaptureCameraController(private val context: Context) {
         } catch (error: Exception) {
             encoder.stop()
             dir.deleteRecursively()
+            lastArmFailureReason = formatProtocolError(error.message ?: "ENCODER_START_FAILED")
             setError(error.message ?: "Encoder start failed")
             return null
         }

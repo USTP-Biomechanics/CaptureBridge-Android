@@ -59,14 +59,16 @@ class TcpController(private val context: Context) {
     private var discoveryOnResolved: ((String) -> Unit)? = null
     private var reconnectFuture: ScheduledFuture<*>? = null
 
-    fun connect(host: String, port: Int, preferDiscovery: Boolean = false) {
+    fun connect(host: String, port: Int, preferDiscovery: Boolean = false, quietRetry: Boolean = false) {
         this.preferDiscovery = preferDiscovery
         lastHost = host
         lastPort = port
         reconnectFuture?.cancel(false)
         val connectGeneration = generation.incrementAndGet()
         closeSocket()
-        updateState(ConnectionState.Connecting)
+        if (!quietRetry) {
+            updateState(ConnectionState.Connecting)
+        }
 
         connectExecutor.execute {
             try {
@@ -83,14 +85,19 @@ class TcpController(private val context: Context) {
                 receiveLoop(nextSocket, connectGeneration)
             } catch (error: Exception) {
                 if (connectGeneration == generation.get()) {
-                    updateState(ConnectionState.Failed(error.message ?: "Connection failed"))
+                    if (quietRetry) {
+                        postDiscoveryStatus("Waiting for hub...")
+                        updateState(ConnectionState.Idle)
+                    } else {
+                        updateState(ConnectionState.Failed(error.message ?: "Connection failed"))
+                    }
                     scheduleReconnectIfNeeded()
                 }
             }
         }
     }
 
-    fun discoverAndConnect(port: Int, onResolved: ((String) -> Unit)? = null) {
+    fun discoverAndConnect(port: Int, quietRetry: Boolean = false, onResolved: ((String) -> Unit)? = null) {
         preferDiscovery = true
         lastHost = null
         lastPort = port
@@ -98,8 +105,13 @@ class TcpController(private val context: Context) {
         reconnectFuture?.cancel(false)
         generation.incrementAndGet()
         closeSocket()
-        updateState(ConnectionState.Connecting)
-        postDiscoveryStatus("Discovering...")
+        if (quietRetry) {
+            updateState(ConnectionState.Idle)
+            postDiscoveryStatus("Waiting for hub...")
+        } else {
+            updateState(ConnectionState.Connecting)
+            postDiscoveryStatus("Discovering...")
+        }
 
         connectExecutor.execute {
             try {
@@ -129,13 +141,17 @@ class TcpController(private val context: Context) {
                     val resolvedPort = parts.getOrNull(1)?.toIntOrNull() ?: port
                     postDiscoveryStatus("Discovery OK")
                     mainHandler.post { discoveryOnResolved?.invoke(resolvedHost) }
-                    connect(resolvedHost, resolvedPort, preferDiscovery = true)
+                    connect(resolvedHost, resolvedPort, preferDiscovery = true, quietRetry = quietRetry)
                 }
             } catch (_: SocketTimeoutException) {
-                postDiscoveryStatus("Discovery timeout, retrying...")
-                scheduleReconnectIfNeeded()
+                tryUsbReverseFallback(port, quietRetry)
             } catch (error: Exception) {
-                updateState(ConnectionState.Failed(error.message ?: "Discovery failed"))
+                if (quietRetry) {
+                    postDiscoveryStatus("Waiting for hub...")
+                    updateState(ConnectionState.Idle)
+                } else {
+                    updateState(ConnectionState.Failed(error.message ?: "Discovery failed"))
+                }
                 scheduleReconnectIfNeeded()
             }
         }
@@ -254,14 +270,35 @@ class TcpController(private val context: Context) {
         reconnectFuture?.cancel(false)
         reconnectFuture = scheduler.schedule({
             if (preferDiscovery) {
-                discoverAndConnect(port, discoveryOnResolved)
+                discoverAndConnect(port, quietRetry = true, onResolved = discoveryOnResolved)
             } else {
                 val host = lastHost
                 if (host != null) {
-                    connect(host, port)
+                    connect(host, port, quietRetry = true)
                 }
             }
         }, 1, TimeUnit.SECONDS)
+    }
+
+    private fun tryUsbReverseFallback(port: Int, quietRetry: Boolean) {
+        if (!quietRetry) {
+            postDiscoveryStatus("Discovery timeout, trying USB reverse...")
+        }
+        try {
+            val host = "127.0.0.1"
+            val nextSocket = Socket()
+            nextSocket.tcpNoDelay = true
+            nextSocket.connect(InetSocketAddress(host, port), 500)
+            socket = nextSocket
+            mainHandler.post { discoveryOnResolved?.invoke(host) }
+            updateState(ConnectionState.Connected)
+            sendHello()
+            receiveLoop(nextSocket, generation.get())
+        } catch (_: Exception) {
+            postDiscoveryStatus("Waiting for hub...")
+            updateState(ConnectionState.Idle)
+            scheduleReconnectIfNeeded()
+        }
     }
 
     private fun broadcastTargets(): List<InetAddress> {

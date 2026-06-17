@@ -20,7 +20,11 @@ data class RollingVideoSegmentResult(
     val requestedEndUs: Long,
     val muxedStartUs: Long,
     val muxedEndUs: Long,
-    val prerollMs: Long
+    val prerollMs: Long,
+    val cameraLeadUs: Long,
+    val frameSelectionPolicy: String,
+    val allIntra: Boolean,
+    val timestampSource: String
 )
 
 class RollingVideoEncoder(
@@ -30,7 +34,8 @@ class RollingVideoEncoder(
     private val bitRate: Int,
     private val orientationDegrees: Int,
     private val prerollMs: Long,
-    private val tempDir: File
+    private val tempDir: File,
+    private val useTimestampedInput: Boolean = true
 ) {
     private data class MemorySample(
         val presentationUs: Long,
@@ -57,13 +62,16 @@ class RollingVideoEncoder(
     private var draining = false
     private var outputFormat: MediaFormat? = null
     private var latestPresentationUs = 0L
-    private var latestSampleWallNs = System.nanoTime()
+    private var latestInputPresentationUs = 0L
+    private var latestInputWallNs = System.nanoTime()
+    private var timestampedInput: TimestampedCameraInput? = null
 
     private var segmentFile: File? = null
     private var segmentData: RandomAccessFile? = null
     private var segmentActive = false
     private var requestedStartUs = 0L
     private var requestedEndUs = 0L
+    private var segmentCameraLeadUs = 0L
 
     fun start(): Surface {
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -71,58 +79,109 @@ class RollingVideoEncoder(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps.coerceAtLeast(1))
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0)
         }
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val inputSurface = encoder.createInputSurface()
-        encoder.start()
+        val codecInputSurface = encoder.createInputSurface()
+        val cameraSurface = if (useTimestampedInput) {
+            val timestampInput = TimestampedCameraInput(
+                codecInputSurface = codecInputSurface,
+                width = width,
+                height = height,
+                onFrameSubmitted = { presentationUs ->
+                    synchronized(lock) {
+                        latestInputPresentationUs = presentationUs
+                        latestInputWallNs = System.nanoTime()
+                    }
+                }
+            )
+            try {
+                timestampInput.start()
+            } catch (error: Exception) {
+                codecInputSurface.release()
+                encoder.release()
+                throw error
+            }.also {
+                timestampedInput = timestampInput
+            }
+        } else {
+            codecInputSurface
+        }
+        try {
+            encoder.start()
+        } catch (error: Exception) {
+            timestampedInput?.stop()
+            if (!useTimestampedInput) {
+                codecInputSurface.release()
+            }
+            encoder.release()
+            throw error
+        }
 
         codec = encoder
-        surface = inputSurface
+        surface = cameraSurface
         draining = true
         drainThread = Thread({ drainLoop() }, "rolling-video-encoder").also { it.start() }
         requestKeyFrame()
-        return inputSurface
+        return cameraSurface
     }
 
     fun inputSurface(): Surface? = surface
 
     fun isReady(): Boolean = synchronized(lock) {
-        outputFormat != null && latestPresentationUs > 0L
+        outputFormat != null && latestPresentationUs > 0L &&
+            (!useTimestampedInput || latestInputPresentationUs > 0L)
     }
 
-    fun beginSegment() {
-        synchronized(lock) {
+    fun beginSegment(commandReceivedWallNs: Long? = null, cameraLeadUs: Long = 0L): Long {
+        val startUs = synchronized(lock) {
             closeSegmentSpoolLocked(deleteFile = true)
             segmentSamples.clear()
-            requestedStartUs = estimateCurrentPresentationUsLocked() - prerollMs * 1000L
+            segmentCameraLeadUs = cameraLeadUs
+            requestedStartUs = estimatePresentationUsAtWallNsLocked(commandReceivedWallNs) + segmentCameraLeadUs
             requestedEndUs = Long.MAX_VALUE
             segmentFile = File.createTempFile("capturebridge_segment_", ".h264buf", tempDir)
             segmentData = RandomAccessFile(segmentFile, "rw")
-            for (sample in rollingSamples) {
-                appendSegmentSampleLocked(sample.presentationUs, sample.flags, sample.data)
+            if (prerollMs > 0L) {
+                val earliestRollingUs = requestedStartUs - prerollMs * 1000L
+                for (sample in rollingSamples) {
+                    if (sample.presentationUs >= earliestRollingUs) {
+                        appendSegmentSampleLocked(sample.presentationUs, sample.flags, sample.data)
+                    }
+                }
             }
             segmentActive = true
+            requestedStartUs
         }
         requestKeyFrame()
+        return startUs
     }
 
-    fun endSegment() {
-        synchronized(lock) {
-            requestedEndUs = estimateCurrentPresentationUsLocked()
-            segmentActive = false
+    fun endSegment(commandReceivedWallNs: Long? = null): Long {
+        val endUs = synchronized(lock) {
+            requestedEndUs = estimatePresentationUsAtWallNsLocked(commandReceivedWallNs) + segmentCameraLeadUs
+            requestedEndUs
         }
         requestKeyFrame()
+        return endUs
     }
 
     fun finishSegment(outputFile: File): RollingVideoSegmentResult {
-        drainFor(250L)
+        draining = false
+        try {
+            drainThread?.join(1000)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        drainThread = null
+        drainFor(1000L)
         val format: MediaFormat
         val samples: List<SpoolSample>
         val dataFile: File
         val startUs: Long
         val endUs: Long
         synchronized(lock) {
+            segmentActive = false
             format = outputFormat ?: throw IllegalStateException("Encoder output format is not ready")
             dataFile = segmentFile ?: throw IllegalStateException("No encoded segment data")
             segmentData?.fd?.sync()
@@ -179,7 +238,11 @@ class RollingVideoEncoder(
             requestedEndUs = endUs,
             muxedStartUs = samples.first().presentationUs,
             muxedEndUs = samples.last().presentationUs,
-            prerollMs = prerollMs
+            prerollMs = prerollMs,
+            cameraLeadUs = segmentCameraLeadUs,
+            frameSelectionPolicy = FRAME_SELECTION_POLICY,
+            allIntra = true,
+            timestampSource = timestampSource()
         )
     }
 
@@ -197,6 +260,8 @@ class RollingVideoEncoder(
         } catch (_: Exception) {
         }
         drainFor(100L)
+        timestampedInput?.stop()
+        timestampedInput = null
         try {
             codec?.stop()
         } catch (_: Exception) {
@@ -205,11 +270,13 @@ class RollingVideoEncoder(
             codec?.release()
         } catch (_: Exception) {
         }
-        codec = null
-        try {
-            surface?.release()
-        } catch (_: Exception) {
+        if (!useTimestampedInput) {
+            try {
+                surface?.release()
+            } catch (_: Exception) {
+            }
         }
+        codec = null
         surface = null
         synchronized(lock) {
             rollingSamples.clear()
@@ -264,7 +331,6 @@ class RollingVideoEncoder(
         }
         synchronized(lock) {
             latestPresentationUs = presentationUs
-            latestSampleWallNs = System.nanoTime()
             val sample = MemorySample(presentationUs, flags, data)
             rollingSamples.addLast(sample)
             while (rollingSamples.isNotEmpty() && rollingSamples.first.presentationUs < presentationUs - retentionUs) {
@@ -286,28 +352,49 @@ class RollingVideoEncoder(
 
     private fun chooseMuxSamplesLocked(startUs: Long, endUs: Long): List<SpoolSample> {
         val candidates = segmentSamples
-            .filter { it.presentationUs <= endUs }
             .sortedBy { it.presentationUs }
         if (candidates.isEmpty()) {
             return emptyList()
         }
-        val syncBeforeStart = candidates.indexOfLast {
-            it.presentationUs <= startUs && (it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+        val endIndex = candidates.indexOfFirst { it.presentationUs >= endUs }
+            .takeIf { it >= 0 }
+            ?: (candidates.size - 1)
+        val selectable = candidates.take(endIndex + 1)
+        if (selectable.isEmpty()) {
+            return emptyList()
         }
-        val firstSync = candidates.indexOfFirst {
-            (it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-        }
-        val startIndex = when {
-            syncBeforeStart >= 0 -> syncBeforeStart
-            firstSync >= 0 -> firstSync
-            else -> 0
-        }
-        return candidates.drop(startIndex)
+
+        val nearestSyncStart = selectable.withIndex()
+            .filter { (_index, sample) -> (sample.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 }
+            .minWithOrNull(
+                compareBy<IndexedValue<SpoolSample>> { absUs(it.value.presentationUs - startUs) }
+                    .thenBy { if (it.value.presentationUs >= startUs) 0 else 1 }
+            )
+        val nearestAnyStart = selectable.withIndex()
+            .minWithOrNull(
+                compareBy<IndexedValue<SpoolSample>> { absUs(it.value.presentationUs - startUs) }
+                    .thenBy { if (it.value.presentationUs >= startUs) 0 else 1 }
+            )
+        val startIndex = nearestSyncStart?.index ?: nearestAnyStart?.index ?: 0
+        return candidates.subList(startIndex, endIndex + 1)
     }
 
     private fun estimateCurrentPresentationUsLocked(): Long {
-        val elapsedUs = (System.nanoTime() - latestSampleWallNs) / 1000L
-        return latestPresentationUs + elapsedUs.coerceAtLeast(0L)
+        return estimatePresentationUsAtWallNsLocked(System.nanoTime())
+    }
+
+    private fun estimatePresentationUsAtWallNsLocked(wallNs: Long? = null): Long {
+        if (latestInputPresentationUs <= 0L) {
+            if (!useTimestampedInput) {
+                val referenceNs = wallNs ?: System.nanoTime()
+                return referenceNs / 1000L
+            }
+            throw IllegalStateException("Timestamped encoder input is not ready")
+        }
+        val referenceNs = wallNs ?: System.nanoTime()
+        val elapsedUs = (referenceNs - latestInputWallNs) / 1000L
+        return latestInputPresentationUs + elapsedUs
     }
 
     private fun requestKeyFrame() {
@@ -333,4 +420,18 @@ class RollingVideoEncoder(
         }
         segmentFile = null
     }
+
+    private fun absUs(value: Long): Long = if (value == Long.MIN_VALUE) Long.MAX_VALUE else kotlin.math.abs(value)
+
+    private fun timestampSource(): String =
+        if (useTimestampedInput) {
+            "surface_texture_egl_presentation_time"
+        } else {
+            "direct_mediacodec_input_surface_system_time"
+        }
+
+    companion object {
+        private const val FRAME_SELECTION_POLICY = "nearest_start_first_after_stop"
+    }
+
 }
