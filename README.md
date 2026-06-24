@@ -18,8 +18,10 @@ inverse-kinematics pipelines.
 CaptureBridge Android is the phone-side companion to
 [USTP-Biomechanics/CaptureBridge-Hub](https://github.com/USTP-Biomechanics/CaptureBridge-Hub),
 the Windows desktop controller and transfer host. For normal lab installs, the
-Hub release ZIP includes a ready-to-install `app-release.apk`; use this Android
-repository when building or modifying the phone client.
+Hub release ZIP is downloaded separately from the Android phone client. Install
+`CaptureBridge-Android.apk` from the
+[latest CaptureBridge Android release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/latest);
+use this Android repository when building or modifying the phone client.
 
 ## Main Features
 
@@ -86,10 +88,11 @@ updates the matching GitHub Release and uploads `CaptureBridge-Android.apk`.
 
 ## Installation
 
-For normal lab use, install the ready-to-install `app-release.apk` bundled in
-the CaptureBridge Hub portable release. If you build from this Android
-repository, use the release APK produced by the normal Gradle or GitHub Actions
-release workflow.
+For normal lab use, install `CaptureBridge-Android.apk` from the
+[latest CaptureBridge Android release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/latest).
+The CaptureBridge Hub portable release is distributed separately and does not
+bundle the Android APK. If you build from this Android repository, use the
+release APK produced by the normal Gradle or GitHub Actions release workflow.
 
 Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.
