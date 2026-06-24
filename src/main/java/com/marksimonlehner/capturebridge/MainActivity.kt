@@ -375,9 +375,18 @@ private fun handleTcpCommand(
         }
         "STOP" -> {
             setStatus("Received STOP")
-            cameraController.stopRecording(commandReceivedWallNs = phoneRxWallNs) { response ->
-                tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
-            }
+            cameraController.stopRecording(
+                commandReceivedWallNs = phoneRxWallNs,
+                onMarked = { response ->
+                    tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                },
+                onReady = { response ->
+                    tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                },
+                completion = { response ->
+                    tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                }
+            )
         }
         "LIST" -> {
             tcpController.sendLine("LIST_OK ${cameraController.buildCaptureListJSON()}")

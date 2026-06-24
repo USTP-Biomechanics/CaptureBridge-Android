@@ -346,13 +346,18 @@ class CaptureCameraController(private val context: Context) {
         handler.post { prepareForRecordingInternal(completion) }
     }
 
-    fun stopRecording(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+    fun stopRecording(
+        commandReceivedWallNs: Long? = null,
+        onMarked: (String) -> Unit = {},
+        onReady: (String) -> Unit = {},
+        completion: (String) -> Unit = {}
+    ) {
         val handler = backgroundHandler
         if (handler == null) {
             completion("STOP_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { stopRecordingInternal(commandReceivedWallNs, completion) }
+        handler.post { stopRecordingInternal(commandReceivedWallNs, onMarked, onReady, completion) }
     }
 
     fun transferBusyReason(): String? {
@@ -882,7 +887,12 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    private fun stopRecordingInternal(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+    private fun stopRecordingInternal(
+        commandReceivedWallNs: Long? = null,
+        onMarked: (String) -> Unit = {},
+        onReady: (String) -> Unit = {},
+        completion: (String) -> Unit = {}
+    ) {
         val requestBeginNs = SystemClock.elapsedRealtimeNanos()
         if (!recording) {
             completion("STOP_OK NOT_RECORDING")
@@ -907,6 +917,12 @@ class CaptureCameraController(private val context: Context) {
         try {
             requestedEndUs = encoder?.endSegment(commandReceivedWallNs)
             segmentMarkedNs = SystemClock.elapsedRealtimeNanos()
+            onMarked(
+                "STOP_MARKED ROLLING_BUFFER " +
+                    "phone_stop_begin_ns=$requestBeginNs " +
+                    "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
+                    "requested_end_us=${requestedEndUs ?: -1L}"
+            )
             if (encoder != null && videoFile != null) {
                 val segment = encoder.finishSegment(videoFile)
                 muxDoneNs = SystemClock.elapsedRealtimeNanos()
@@ -951,11 +967,24 @@ class CaptureCameraController(private val context: Context) {
         pendingStopDate = null
         pendingStopLabel = null
         recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
-            if (success && selectedResolution.highSpeed) {
-                scheduleHighSpeedPrearm(delayMs = 100L)
-            }
             if (!success) {
                 setError("Preview rearm failed after stop")
+                onReady("READY_ERR PREVIEW_REARM_FAILED")
+                return@recreateIdleSession
+            }
+            onReady("READY PREVIEW")
+            if (selectedResolution.highSpeed) {
+                scheduleHighSpeedPrearm(delayMs = 100L, onPrepared = onReady)
+            } else {
+                waitForPreparedEncoder(rearmIfNeeded = false) { ready, reason ->
+                    onReady(
+                        if (ready) {
+                            "PREPARE_OK READY preroll_ms=$prerollMs camera_lead_ms=${cameraLeadUs / 1000.0}"
+                        } else {
+                            "PREPARE_ERR $reason"
+                        }
+                    )
+                }
             }
         }
     }
@@ -1621,7 +1650,7 @@ class CaptureCameraController(private val context: Context) {
         highSpeedPrearmGeneration.incrementAndGet()
     }
 
-    private fun scheduleHighSpeedPrearm(delayMs: Long = 900L) {
+    private fun scheduleHighSpeedPrearm(delayMs: Long = 900L, onPrepared: (String) -> Unit = {}) {
         val handler = backgroundHandler ?: return
         val generation = highSpeedPrearmGeneration.incrementAndGet()
         handler.postDelayed({
@@ -1632,7 +1661,11 @@ class CaptureCameraController(private val context: Context) {
                 return@postDelayed
             }
             recreateIdleSession(clearArm = true, forceArm = true) { success ->
-                if (!success && generation == highSpeedPrearmGeneration.get()) {
+                val ready = success && waitForRollingEncoderReady(armedCapture, timeoutMs = 2500L)
+                if (ready) {
+                    onPrepared("PREPARE_OK READY preroll_ms=$prerollMs camera_lead_ms=${cameraLeadUs / 1000.0}")
+                } else if (generation == highSpeedPrearmGeneration.get()) {
+                    onPrepared("PREPARE_ERR ${armFailureReason()}")
                     recreateIdleSession(clearArm = true, allowArm = false)
                 }
             }

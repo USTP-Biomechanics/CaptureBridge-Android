@@ -168,7 +168,9 @@ Common Android responses include:
 - `NAME_OK`
 - `PREPARE_OK READY preroll_ms=<ms> camera_lead_ms=<ms>`
 - `START_OK`
+- `STOP_MARKED ROLLING_BUFFER`
 - `STOP_OK`
+- `READY PREVIEW`
 - `LIST_OK <json>`
 - `SETTINGS_LIST_OK <json>`
 - `SETTINGS_OK <json>`
