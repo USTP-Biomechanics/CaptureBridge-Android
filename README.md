@@ -30,7 +30,11 @@ repository when building or modifying the phone client.
 - Remote camera setting requests for resolution, frame rate, ISO, and shutter
   time where supported by the phone
 - Raw live preview streaming to the Hub over UDP `6101`
-- H.264 MP4 recording through Android `MediaRecorder`
+- Pre-armed H.264 MP4 recording through Android `MediaCodec`
+- Rolling encoded video buffer with configurable preroll before the Hub's
+  `START` command
+- Start/stop trimming when finalizing captures, including phone-side command
+  timing fields for downstream alignment checks
 - Local capture storage before transfer
 - Per-capture metadata files:
   - `.mp4` video
@@ -110,10 +114,14 @@ private storage and are transferred only when the Hub sends a transfer command.
 5. Wait for the app to discover and connect to the Hub.
 6. Confirm the phones appear in the Hub.
 7. Configure the capture name and camera settings in the Hub.
-8. Press `START` in the Hub to begin recording on all connected phones.
-9. Press `STOP` in the Hub to end recording.
-10. Transfer the current capture or all captures from the Hub.
-11. Use the Hub's stream checkboxes when live phone preview is needed.
+8. Let the Hub prepare/arm the phones when it sends the capture name or an
+   explicit `PREPARE`/`ARM` command. While armed, the phone keeps a rolling
+   encoded buffer so the capture can include a short preroll before `START`.
+9. Press `START` in the Hub to mark the segment start on all connected phones.
+10. Press `STOP` in the Hub to mark the segment end and finalize the trimmed
+   MP4 file.
+11. Transfer the current capture or all captures from the Hub.
+12. Use the Hub's stream checkboxes when live phone preview is needed.
 
 The Android screen shows connection state, recording state, the active capture
 label, camera settings, and transfer state.
@@ -141,6 +149,8 @@ HELLO <device_name>
 Supported Hub commands include:
 
 - `NAME <capture_label>`
+- `PREPARE [<preroll_ms>|<json>]`
+- `ARM [<preroll_ms>|<json>]`
 - `START`
 - `STOP`
 - `LIST`
@@ -156,6 +166,7 @@ Supported Hub commands include:
 Common Android responses include:
 
 - `NAME_OK`
+- `PREPARE_OK READY preroll_ms=<ms> camera_lead_ms=<ms>`
 - `START_OK`
 - `STOP_OK`
 - `LIST_OK <json>`
@@ -192,13 +203,25 @@ fields where available, lens position, exposure time, ISO, and zoom. The state
 JSON stores device, camera, resolution, frame-rate, shutter, ISO, manual-sensor
 support, orientation, and platform information.
 
+The current recording backend pre-arms a `MediaCodec` H.264 encoder before the
+Hub starts a capture. Encoded samples are retained in a rolling in-memory buffer
+and the final MP4 is muxed only after `STOP`, using the requested start and end
+times. This lets the app keep the camera and encoder hot, include a configurable
+preroll window before `START`, and cut the saved video to the commanded segment.
+The state JSON also records the rolling-buffer backend, preroll duration,
+requested and muxed presentation timestamps, camera lead compensation, and frame
+selection policy.
+
 ## Synchronization Note
 
-CaptureBridge coordinates acquisition by sending start and stop commands over a
-local WLAN/TCP connection. This is useful for near-simultaneous recording and
-structured multi-device acquisition, but this version does not claim measured
-frame-level synchronization. Studies that require frame-accurate timing should
-validate timing with an external optical or electronic reference.
+CaptureBridge coordinates acquisition by sending prepare, start, and stop
+commands over a local WLAN/TCP connection. The Android app pre-arms the camera
+pipeline and returns phone-side receive/transmit timing fields on key command
+responses, which helps inspect command timing and trim the saved MP4 around the
+requested segment. This is useful for near-simultaneous recording and structured
+multi-device acquisition, but this version does not claim measured frame-level
+synchronization. Studies that require frame-accurate timing should validate
+timing with an external optical or electronic reference.
 
 ## Troubleshooting
 
@@ -225,9 +248,9 @@ validate timing with an external optical or electronic reference.
 
 ### Transfer is blocked
 
-The app returns `BUSY` when it is recording, warming up the camera, or already
-transferring files. Stop the recording and wait for active transfers to finish
-before requesting another transfer or delete action.
+The app returns `BUSY` when it is recording, warming up or arming the camera, or
+already transferring files. Stop the recording and wait for active transfers to
+finish before requesting another transfer or delete action.
 
 ## Repository Layout
 
@@ -238,7 +261,9 @@ compatibility. The root Gradle project is the Android application.
 src/main/java/com/marksimonlehner/capturebridge/
   MainActivity.kt              Android UI and Hub command handling
   TcpController.kt             UDP discovery, TCP connection, and file transfer
-  CaptureCameraController.kt   Camera2, MediaRecorder, capture storage, metadata
+  CaptureCameraController.kt   Camera2 sessions, capture storage, metadata
+  RollingVideoEncoder.kt       MediaCodec rolling buffer and MP4 segment muxing
+  TimestampedCameraInput.kt    Timestamped camera frames for encoder input
   PhoneLivePreviewStreamer.kt  UDP JPEG live preview stream
 src/main/AndroidManifest.xml
 proguard-rules.pro
