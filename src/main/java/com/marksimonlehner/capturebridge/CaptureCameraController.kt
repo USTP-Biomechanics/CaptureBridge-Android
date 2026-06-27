@@ -12,6 +12,7 @@ import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.media.AudioManager
@@ -89,6 +90,9 @@ private data class ArmedCapture(
     val stateFile: File,
     val encoder: RollingVideoEncoder,
     val encoderSurface: Surface,
+    val useTimestampedInput: Boolean,
+    val highSpeedTimestampedRequested: Boolean,
+    val useSensorTimestampMapping: Boolean,
     val intrinsicCalibration: FloatArray?
 )
 
@@ -102,6 +106,10 @@ class CaptureCameraController(private val context: Context) {
     private val highSpeedPrearmGeneration = AtomicInteger(0)
     private val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
     private val characteristicsCache = mutableMapOf<String, CameraCharacteristics>()
+    private var lastEncoderTimestampedInput = false
+    private var lastHighSpeedTimestampedRequested = false
+    private var lastEncoderSensorTimestampMapping = false
+    private var lastHighSpeedEncoderOnlyCapture = false
 
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
@@ -139,7 +147,16 @@ class CaptureCameraController(private val context: Context) {
     private var intrinsicsWriter: BufferedWriter? = null
     private var activeIntrinsicCalibration: FloatArray? = null
     private var frameIndex = 0
+    private var captureResultIndex = 0
     private var firstSensorTimestampNs: Long? = null
+    private var captureStartedCount = 0
+    private var captureCompletedCount = 0
+    private var captureFailedCount = 0
+    private var captureBufferLostCount = 0
+    private var captureSequenceAbortedCount = 0
+    private var captureSequenceCompletedCount = 0
+    private var lastCaptureFailureReason: String? = null
+    private var lastCaptureBufferLostFrameNumber: Long? = null
 
     private val textureListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -161,13 +178,68 @@ class CaptureCameraController(private val context: Context) {
     }
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureStarted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            timestamp: Long,
+            frameNumber: Long
+        ) {
+            if (recording) {
+                captureStartedCount += 1
+            }
+            noteEncoderSensorTimestamp(timestamp, frameNumber)
+        }
+
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: android.hardware.camera2.TotalCaptureResult
         ) {
             if (recording) {
-                appendIntrinsics(result)
+                captureCompletedCount += 1
+                captureResultIndex += 1
+                if (shouldWriteIntrinsicsSample()) {
+                    appendIntrinsics(result, captureResultIndex)
+                }
+            }
+        }
+
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: CaptureFailure
+        ) {
+            if (recording) {
+                captureFailedCount += 1
+                lastCaptureFailureReason = captureFailureReason(failure.reason)
+            }
+        }
+
+        override fun onCaptureBufferLost(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            target: Surface,
+            frameNumber: Long
+        ) {
+            if (recording) {
+                captureBufferLostCount += 1
+                lastCaptureBufferLostFrameNumber = frameNumber
+            }
+        }
+
+        override fun onCaptureSequenceCompleted(
+            session: CameraCaptureSession,
+            sequenceId: Int,
+            frameNumber: Long
+        ) {
+            if (recording) {
+                captureSequenceCompletedCount += 1
+            }
+        }
+
+        override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+            if (recording) {
+                captureSequenceAbortedCount += 1
             }
         }
     }
@@ -273,7 +345,7 @@ class CaptureCameraController(private val context: Context) {
                 updateLivePreviewSummary(state.summary())
                 stateNotifier(state.toJsonString())
                 if (!recording && cameraDevice != null) {
-                    recreateIdleSession(clearArm = true)
+                    recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
                 }
             }
         }
@@ -285,9 +357,7 @@ class CaptureCameraController(private val context: Context) {
         backgroundHandler?.post {
             closeLivePreviewReader()
             if (!recording && cameraDevice != null) {
-                recreateIdleSession(clearArm = true) {
-                    scheduleHighSpeedPrearm(delayMs = 100L)
-                }
+                recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
             }
         }
         val state = LivePreviewState(
@@ -319,7 +389,7 @@ class CaptureCameraController(private val context: Context) {
         prerollMs = clamped
         backgroundHandler?.post {
             if (!recording && cameraDevice != null) {
-                recreateIdleSession(clearArm = true)
+                recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
             }
         }
     }
@@ -328,13 +398,17 @@ class CaptureCameraController(private val context: Context) {
         cameraLeadUs = (rawMs.coerceIn(0.0, 5000.0) * 1000.0).toLong()
     }
 
-    fun startRecording(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+    fun startRecording(
+        commandReceivedWallNs: Long? = null,
+        commandReceivedElapsedNs: Long? = null,
+        completion: (String) -> Unit = {}
+    ) {
         val handler = backgroundHandler
         if (handler == null) {
             completion("START_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { startRecordingInternal(commandReceivedWallNs, completion) }
+        handler.post { startRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, completion) }
     }
 
     fun prepareForRecording(completion: (String) -> Unit = {}) {
@@ -348,6 +422,7 @@ class CaptureCameraController(private val context: Context) {
 
     fun stopRecording(
         commandReceivedWallNs: Long? = null,
+        commandReceivedElapsedNs: Long? = null,
         onMarked: (String) -> Unit = {},
         onReady: (String) -> Unit = {},
         completion: (String) -> Unit = {}
@@ -357,7 +432,7 @@ class CaptureCameraController(private val context: Context) {
             completion("STOP_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { stopRecordingInternal(commandReceivedWallNs, onMarked, onReady, completion) }
+        handler.post { stopRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, onMarked, onReady, completion) }
     }
 
     fun transferBusyReason(): String? {
@@ -485,9 +560,6 @@ class CaptureCameraController(private val context: Context) {
             ) { success ->
                 if (success) {
                     completion(buildCameraSettingsJSON(), null)
-                    if (!useHighSpeedSession && selectedResolution.highSpeed) {
-                        scheduleHighSpeedPrearm(delayMs = 100L)
-                    }
                 } else {
                     completion(null, "FORMAT_APPLY_FAILED")
                 }
@@ -612,9 +684,7 @@ class CaptureCameraController(private val context: Context) {
         val view = textureView ?: return
         if (!view.isAvailable || cameraDevice != null) {
             if (cameraDevice != null && !recording) {
-                recreateIdleSession {
-                    scheduleHighSpeedPrearm(delayMs = 100L)
-                }
+                recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
             }
             return
         }
@@ -641,9 +711,7 @@ class CaptureCameraController(private val context: Context) {
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         cameraDevice = camera
-                        recreateIdleSession(clearArm = true) {
-                            scheduleHighSpeedPrearm(delayMs = 100L)
-                        }
+                        recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -668,6 +736,7 @@ class CaptureCameraController(private val context: Context) {
         clearArm: Boolean = false,
         allowArm: Boolean = true,
         forceArm: Boolean = false,
+        highSpeedTimestampedInput: Boolean = EXPERIMENT_HIGH_SPEED_TIMESTAMPED_INPUT,
         onConfigured: ((Boolean) -> Unit)? = null
     ) {
         if (recording) {
@@ -685,10 +754,6 @@ class CaptureCameraController(private val context: Context) {
         if (clearArm) {
             discardArmedCapture()
         }
-        val surface = preparePreviewSurface() ?: run {
-            onConfigured?.invoke(false)
-            return
-        }
         val livePreviewSurface = if (livePreviewStreamer != null) {
             prepareLivePreviewSurface() ?: run {
                 onConfigured?.invoke(false)
@@ -699,7 +764,14 @@ class CaptureCameraController(private val context: Context) {
             null
         }
         val shouldPrepareArmedCapture = allowArm && (!selectedResolution.highSpeed || forceArm)
-        val armed = if (shouldPrepareArmedCapture) prepareArmedCapture() else null
+        val armed = if (shouldPrepareArmedCapture) {
+            prepareArmedCapture(
+                useTimestampedInput = !selectedResolution.highSpeed || highSpeedTimestampedInput,
+                highSpeedTimestampedRequested = selectedResolution.highSpeed && highSpeedTimestampedInput
+            )
+        } else {
+            null
+        }
         if (shouldPrepareArmedCapture && armed == null) {
             if (lastArmFailureReason == null) {
                 lastArmFailureReason = "ENCODER_SETUP_FAILED"
@@ -709,9 +781,23 @@ class CaptureCameraController(private val context: Context) {
         }
         val template = if (armed != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val useHighSpeedSession = armed != null && livePreviewSurface == null && isSelectedHighSpeedMode()
-        val includePreviewSurface = true
+        val highSpeedEncoderOnlyCapture =
+            useHighSpeedSession && HIGH_SPEED_ENCODER_ONLY_CAPTURE && armed?.useTimestampedInput == false
+        val includePreviewSurface = !highSpeedEncoderOnlyCapture &&
+            !(useHighSpeedSession && armed?.useTimestampedInput == true)
+        val surface = if (includePreviewSurface) {
+            preparePreviewSurface() ?: run {
+                onConfigured?.invoke(false)
+                return
+            }
+        } else {
+            previewSurface?.release()
+            previewSurface = null
+            null
+        }
+        lastHighSpeedEncoderOnlyCapture = highSpeedEncoderOnlyCapture
         val outputs = buildList {
-            if (includePreviewSurface) {
+            if (surface != null) {
                 add(surface)
             }
             livePreviewSurface?.let { add(it) }
@@ -735,7 +821,7 @@ class CaptureCameraController(private val context: Context) {
                         captureSessionArmed = armed != null
                         try {
                             val request = device.createCaptureRequest(template).apply {
-                                if (includePreviewSurface) {
+                                if (surface != null) {
                                     addTarget(surface)
                                 }
                                 livePreviewSurface?.let { addTarget(it) }
@@ -762,6 +848,17 @@ class CaptureCameraController(private val context: Context) {
                             }
                             captureSession = null
                             captureSessionArmed = false
+                            if (shouldRetryDirectHighSpeedInput(armed)) {
+                                discardArmedCapture()
+                                recreateIdleSession(
+                                    clearArm = false,
+                                    allowArm = allowArm,
+                                    forceArm = forceArm,
+                                    highSpeedTimestampedInput = false,
+                                    onConfigured = onConfigured
+                                )
+                                return
+                            }
                             if (armed != null && allowArm && !forceArm) {
                                 discardArmedCapture()
                                 recreateIdleSession(allowArm = false, onConfigured = onConfigured)
@@ -779,6 +876,17 @@ class CaptureCameraController(private val context: Context) {
                             return
                         }
                         captureSessionArmed = false
+                        if (shouldRetryDirectHighSpeedInput(armed)) {
+                            discardArmedCapture()
+                            recreateIdleSession(
+                                clearArm = false,
+                                allowArm = allowArm,
+                                forceArm = forceArm,
+                                highSpeedTimestampedInput = false,
+                                onConfigured = onConfigured
+                            )
+                            return
+                        }
                         if (armed != null && allowArm && !forceArm) {
                             discardArmedCapture()
                             recreateIdleSession(allowArm = false, onConfigured = onConfigured)
@@ -796,8 +904,19 @@ class CaptureCameraController(private val context: Context) {
             } else {
                 device.createCaptureSession(outputs, stateCallback, backgroundHandler)
             }
-        } catch (error: CameraAccessException) {
+        } catch (error: Exception) {
             captureSessionArmed = false
+            if (shouldRetryDirectHighSpeedInput(armed)) {
+                discardArmedCapture()
+                recreateIdleSession(
+                    clearArm = false,
+                    allowArm = allowArm,
+                    forceArm = forceArm,
+                    highSpeedTimestampedInput = false,
+                    onConfigured = onConfigured
+                )
+                return
+            }
             if (armed != null && allowArm && !forceArm) {
                 discardArmedCapture()
                 recreateIdleSession(allowArm = false, onConfigured = onConfigured)
@@ -809,7 +928,11 @@ class CaptureCameraController(private val context: Context) {
         }
     }
 
-    private fun startRecordingInternal(commandReceivedWallNs: Long? = null, completion: (String) -> Unit = {}) {
+    private fun startRecordingInternal(
+        commandReceivedWallNs: Long? = null,
+        commandReceivedElapsedNs: Long? = null,
+        completion: (String) -> Unit = {}
+    ) {
         val requestBeginNs = SystemClock.elapsedRealtimeNanos()
         if (recording) {
             completion("START_OK ALREADY_RECORDING")
@@ -821,6 +944,28 @@ class CaptureCameraController(private val context: Context) {
         }
         cancelHighSpeedPrearm()
         warmingUp.set(true)
+        if (selectedResolution.highSpeed) {
+            val armed = armedCapture
+            if (!captureSessionArmed || armed == null) {
+                warmingUp.set(false)
+                completion("START_ERR NOT_ARMED")
+                return
+            }
+            if (!armed.encoder.isReady()) {
+                warmingUp.set(false)
+                completion("START_ERR ENCODER_NOT_READY")
+                return
+            }
+            startArmedRecording(
+                id = id,
+                armed = armed,
+                requestBeginNs = requestBeginNs,
+                commandReceivedWallNs = commandReceivedWallNs,
+                commandReceivedElapsedNs = commandReceivedElapsedNs,
+                completion = completion
+            )
+            return
+        }
         ensureIdleSessionArmed { armedReady ->
             if (!armedReady || recording) {
                 warmingUp.set(false)
@@ -835,39 +980,71 @@ class CaptureCameraController(private val context: Context) {
                 return@ensureIdleSessionArmed
             }
 
-            frameIndex = 0
-            firstSensorTimestampNs = null
-            pendingStopDate = null
-            pendingStopLabel = null
-            captureDir = armed.dir
-            currentBase = armed.base
-            activeEncoder = armed.encoder
-            armedCapture = null
+            startArmedRecording(
+                id = id,
+                armed = armed,
+                requestBeginNs = requestBeginNs,
+                commandReceivedWallNs = commandReceivedWallNs,
+                commandReceivedElapsedNs = commandReceivedElapsedNs,
+                completion = completion
+            )
+        }
+    }
 
-            try {
-                openIntrinsicsCsv(armed.intrinsicsFile)
-                writeStateJson(armed.stateFile, id, captureLabel)
-                activeIntrinsicCalibration = armed.intrinsicCalibration
-                val requestedStartUs = activeEncoder?.beginSegment(commandReceivedWallNs, cameraLeadUs)
-                val requestMarkedNs = SystemClock.elapsedRealtimeNanos()
-                warmingUp.set(false)
-                recording = true
-                _uiState.update { it.copy(isRecording = true, lastError = null) }
-                playTone(ToneGenerator.TONE_PROP_ACK)
-                completion(
-                    "START_OK ROLLING_BUFFER " +
-                        "phone_start_begin_ns=$requestBeginNs " +
-                        "phone_start_marked_ns=$requestMarkedNs " +
-                        "requested_start_us=${requestedStartUs ?: -1L} " +
-                        "camera_lead_ms=${cameraLeadUs / 1000.0}"
-                )
-            } catch (error: Exception) {
-                warmingUp.set(false)
-                setError(error.message ?: "Recording failed")
-                cleanupFailedRecording()
-                recreateIdleSession(clearArm = true)
-                completion("START_ERR ${formatProtocolError(error.message ?: "RECORDING_FAILED")}")
-            }
+    private fun startArmedRecording(
+        id: String,
+        armed: ArmedCapture,
+        requestBeginNs: Long,
+        commandReceivedWallNs: Long?,
+        commandReceivedElapsedNs: Long?,
+        completion: (String) -> Unit
+    ) {
+        frameIndex = 0
+        captureResultIndex = 0
+        firstSensorTimestampNs = null
+        resetCaptureCounters()
+        pendingStopDate = null
+        pendingStopLabel = null
+        captureDir = armed.dir
+        currentBase = armed.base
+        activeEncoder = armed.encoder
+        armedCapture = null
+
+        try {
+            openIntrinsicsCsv(armed.intrinsicsFile)
+            writeStateJson(armed.stateFile, id, captureLabel)
+            activeIntrinsicCalibration = armed.intrinsicCalibration
+            val requestedStartUs = activeEncoder?.beginSegment(
+                commandReceivedWallNs = commandReceivedWallNs,
+                commandReceivedElapsedNs = commandReceivedElapsedNs,
+                cameraLeadUs = cameraLeadUs
+            )
+            val requestMarkedNs = SystemClock.elapsedRealtimeNanos()
+            warmingUp.set(false)
+            recording = true
+            _uiState.update { it.copy(isRecording = true, lastError = null) }
+            playTone(ToneGenerator.TONE_PROP_ACK)
+            completion(
+                "START_OK ROLLING_BUFFER " +
+                    "phone_start_begin_ns=$requestBeginNs " +
+                    "phone_start_marked_ns=$requestMarkedNs " +
+                    "phone_start_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
+                    "requested_start_us=${requestedStartUs ?: -1L} " +
+                    "encoder_timestamped_input=${activeEncoderTimestampedInput()} " +
+                    "highspeed_timestamped_requested=${activeHighSpeedTimestampedRequested()} " +
+                    "encoder_sensor_timestamp_mapping=${activeEncoderSensorTimestampMapping()} " +
+                    "highspeed_encoder_only_capture=${activeHighSpeedEncoderOnlyCapture()} " +
+                    "configured_bitrate=${activeConfiguredBitRate()} " +
+                    "configured_keyframe_rate_fps=${activeConfiguredKeyFrameRateFps()} " +
+                    "configured_i_frame_interval_us=${activeConfiguredIFrameIntervalUs()} " +
+                    "camera_lead_ms=${cameraLeadUs / 1000.0}"
+            )
+        } catch (error: Exception) {
+            warmingUp.set(false)
+            setError(error.message ?: "Recording failed")
+            cleanupFailedRecording()
+            recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
+            completion("START_ERR ${formatProtocolError(error.message ?: "RECORDING_FAILED")}")
         }
     }
 
@@ -889,6 +1066,7 @@ class CaptureCameraController(private val context: Context) {
 
     private fun stopRecordingInternal(
         commandReceivedWallNs: Long? = null,
+        commandReceivedElapsedNs: Long? = null,
         onMarked: (String) -> Unit = {},
         onReady: (String) -> Unit = {},
         completion: (String) -> Unit = {}
@@ -915,18 +1093,29 @@ class CaptureCameraController(private val context: Context) {
         var segmentMarkedNs: Long? = null
         var muxDoneNs: Long? = null
         try {
-            requestedEndUs = encoder?.endSegment(commandReceivedWallNs)
+            requestedEndUs = encoder?.endSegment(
+                commandReceivedWallNs = commandReceivedWallNs,
+                commandReceivedElapsedNs = commandReceivedElapsedNs
+            )
             segmentMarkedNs = SystemClock.elapsedRealtimeNanos()
             onMarked(
                 "STOP_MARKED ROLLING_BUFFER " +
                     "phone_stop_begin_ns=$requestBeginNs " +
                     "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
+                    "phone_stop_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
                     "requested_end_us=${requestedEndUs ?: -1L}"
             )
             if (encoder != null && videoFile != null) {
                 val segment = encoder.finishSegment(videoFile)
                 muxDoneNs = SystemClock.elapsedRealtimeNanos()
                 writeSegmentJson(segment, File(videoFile.parentFile, "${videoFile.nameWithoutExtension}.segment.json"))
+                writeCameraTimeDiagnosticsJson(
+                    encoder.cameraTimeDiagnosticsJson(
+                        requestedStartUs = segment.requestedStartUs,
+                        requestedEndUs = segment.requestedEndUs
+                    ),
+                    File(videoFile.parentFile, "${videoFile.nameWithoutExtension}.camera_time.json")
+                )
             } else {
                 stopError = "Encoder was not active"
             }
@@ -956,6 +1145,7 @@ class CaptureCameraController(private val context: Context) {
                     "phone_stop_begin_ns=$requestBeginNs " +
                     "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
                     "phone_stop_mux_done_ns=${muxDoneNs ?: -1L} " +
+                    "phone_stop_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
                     "requested_end_us=${requestedEndUs ?: -1L}"
             )
         } else {
@@ -966,16 +1156,14 @@ class CaptureCameraController(private val context: Context) {
         currentBase = null
         pendingStopDate = null
         pendingStopLabel = null
-        recreateIdleSession(clearArm = true, allowArm = !selectedResolution.highSpeed) { success ->
+        recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed) { success ->
             if (!success) {
-                setError("Preview rearm failed after stop")
-                onReady("READY_ERR PREVIEW_REARM_FAILED")
+                setError("Camera rearm failed after stop")
+                onReady("READY_ERR REARM_FAILED")
                 return@recreateIdleSession
             }
-            onReady("READY PREVIEW")
-            if (selectedResolution.highSpeed) {
-                scheduleHighSpeedPrearm(delayMs = 100L, onPrepared = onReady)
-            } else {
+            onReady(if (selectedResolution.highSpeed) "READY ARMED" else "READY PREVIEW")
+            if (!selectedResolution.highSpeed) {
                 waitForPreparedEncoder(rearmIfNeeded = false) { ready, reason ->
                     onReady(
                         if (ready) {
@@ -1062,12 +1250,26 @@ class CaptureCameraController(private val context: Context) {
         livePreviewReader = null
     }
 
-    private fun createRollingVideoEncoder(): RollingVideoEncoder {
+    private fun noteEncoderSensorTimestamp(sensorTimestampNs: Long, frameNumber: Long) {
+        (activeEncoder ?: armedCapture?.encoder)?.noteCameraSensorTimestamp(sensorTimestampNs, frameNumber)
+    }
+
+    private fun shouldRetryDirectHighSpeedInput(armed: ArmedCapture?): Boolean {
+        if (armed == null) {
+            return false
+        }
+        return selectedResolution.highSpeed && armed.highSpeedTimestampedRequested && armed.useTimestampedInput
+    }
+
+    private fun createRollingVideoEncoder(useTimestampedInput: Boolean): RollingVideoEncoder {
         val fps = selectedResolution.maxFps.coerceAtLeast(1)
-        val bitRate = (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.20)
+        val bitRate = (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.14)
             .toLong()
-            .coerceIn(16_000_000L, 160_000_000L)
+            .coerceIn(12_000_000L, 120_000_000L)
             .toInt()
+        val useSensorTimestampMapping =
+            selectedResolution.highSpeed && !useTimestampedInput && EXPERIMENT_HIGH_SPEED_SENSOR_TIMESTAMP_MAPPING
+        val collectSensorTimestampDiagnostics = selectedResolution.highSpeed && !useTimestampedInput
         return RollingVideoEncoder(
             width = selectedResolution.width,
             height = selectedResolution.height,
@@ -1076,9 +1278,51 @@ class CaptureCameraController(private val context: Context) {
             orientationDegrees = orientationHint(),
             prerollMs = prerollMs,
             tempDir = appContext.cacheDir,
-            useTimestampedInput = !selectedResolution.highSpeed
+            useTimestampedInput = useTimestampedInput,
+            useSensorTimestampMapping = useSensorTimestampMapping,
+            collectSensorTimestampDiagnostics = collectSensorTimestampDiagnostics
         )
     }
+
+    private fun activeEncoderTimestampedInput(): Boolean {
+        return activeEncoder?.let { lastEncoderTimestampedInput }
+            ?: armedCapture?.useTimestampedInput
+            ?: lastEncoderTimestampedInput
+    }
+
+    private fun activeHighSpeedTimestampedRequested(): Boolean {
+        return activeEncoder?.let { lastHighSpeedTimestampedRequested }
+            ?: armedCapture?.highSpeedTimestampedRequested
+            ?: lastHighSpeedTimestampedRequested
+    }
+
+    private fun activeEncoderSensorTimestampMapping(): Boolean {
+        return activeEncoder?.let { lastEncoderSensorTimestampMapping }
+            ?: armedCapture?.useSensorTimestampMapping
+            ?: lastEncoderSensorTimestampMapping
+    }
+
+    private fun activeHighSpeedEncoderOnlyCapture(): Boolean =
+        selectedResolution.highSpeed && lastHighSpeedEncoderOnlyCapture
+
+    private fun activeConfiguredBitRate(): Int =
+        (activeEncoder ?: armedCapture?.encoder)?.configuredBitRate() ?: run {
+            val fps = selectedResolution.maxFps.coerceAtLeast(1)
+            (selectedResolution.width.toLong() * selectedResolution.height * fps * 0.14)
+                .toLong()
+                .coerceIn(12_000_000L, 120_000_000L)
+                .toInt()
+        }
+
+    private fun activeConfiguredKeyFrameRateFps(): Int =
+        (activeEncoder ?: armedCapture?.encoder)?.configuredKeyFrameRateFps()
+            ?: selectedResolution.maxFps.coerceAtLeast(1)
+
+    private fun activeConfiguredIFrameIntervalUs(): Long =
+        (activeEncoder ?: armedCapture?.encoder)?.configuredIFrameIntervalUs() ?: 0L
+
+    private fun activeAeFpsRange(): Range<Int>? =
+        bestFpsRange(useHighSpeedSession = isSelectedHighSpeedMode())
 
     private fun applyCameraRequestSettings(
         builder: CaptureRequest.Builder,
@@ -1112,7 +1356,14 @@ class CaptureCameraController(private val context: Context) {
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, clampedIso)
     }
 
-    private fun appendIntrinsics(result: CaptureResult) {
+    private fun shouldWriteIntrinsicsSample(): Boolean {
+        if (!selectedResolution.highSpeed) {
+            return true
+        }
+        return captureResultIndex == 1 || captureResultIndex % HIGH_SPEED_INTRINSICS_SAMPLE_INTERVAL == 0
+    }
+
+    private fun appendIntrinsics(result: CaptureResult, resultIndex: Int) {
         val writer = intrinsicsWriter ?: return
         val timestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: System.nanoTime()
         val startNs = firstSensorTimestampNs ?: timestampNs.also { firstSensorTimestampNs = it }
@@ -1133,7 +1384,7 @@ class CaptureCameraController(private val context: Context) {
             1f
         }
 
-        frameIndex += 1
+        frameIndex = resultIndex
         writer.write(
             String.format(
                 Locale.US,
@@ -1155,10 +1406,28 @@ class CaptureCameraController(private val context: Context) {
                 zoom
             )
         )
-        if (frameIndex % 30 == 0) {
+        if (resultIndex % 30 == 0) {
             writer.flush()
         }
     }
+
+    private fun resetCaptureCounters() {
+        captureStartedCount = 0
+        captureCompletedCount = 0
+        captureFailedCount = 0
+        captureBufferLostCount = 0
+        captureSequenceAbortedCount = 0
+        captureSequenceCompletedCount = 0
+        lastCaptureFailureReason = null
+        lastCaptureBufferLostFrameNumber = null
+    }
+
+    private fun captureFailureReason(reason: Int): String =
+        when (reason) {
+            CaptureFailure.REASON_ERROR -> "ERROR"
+            CaptureFailure.REASON_FLUSHED -> "FLUSHED"
+            else -> "UNKNOWN_$reason"
+        }
 
     private fun FloatArray?.valueAt(index: Int): Float {
         return if (this != null && index in indices) this[index] else 0f
@@ -1194,6 +1463,17 @@ class CaptureCameraController(private val context: Context) {
             .put("target_shutter_seconds", targetShutterSeconds)
             .put("target_iso", targetIso)
             .put("recording_backend", "mediacodec_rolling_buffer")
+            .put("selected_high_speed", selectedResolution.highSpeed)
+            .put("encoder_timestamped_input", activeEncoderTimestampedInput())
+            .put("encoder_sensor_timestamp_mapping", activeEncoderSensorTimestampMapping())
+            .put("highspeed_encoder_only_capture", activeHighSpeedEncoderOnlyCapture())
+            .put("configured_bitrate", activeConfiguredBitRate())
+            .put("configured_keyframe_rate_fps", activeConfiguredKeyFrameRateFps())
+            .put("configured_i_frame_interval_us", activeConfiguredIFrameIntervalUs())
+            .put("active_ae_fps_range_lower", activeAeFpsRange()?.lower ?: JSONObject.NULL)
+            .put("active_ae_fps_range_upper", activeAeFpsRange()?.upper ?: JSONObject.NULL)
+            .put("highspeed_timestamped_input_experiment", EXPERIMENT_HIGH_SPEED_TIMESTAMPED_INPUT)
+            .put("highspeed_timestamped_requested", activeHighSpeedTimestampedRequested())
             .put("preroll_ms", prerollMs)
             .put("manual_sensor_supported", supportsManualSensor(id))
             .put("disable_video_stabilization", true)
@@ -1212,17 +1492,74 @@ class CaptureCameraController(private val context: Context) {
             .put("preroll_ms", result.prerollMs)
             .put("camera_lead_ms", result.cameraLeadUs / 1000.0)
             .put("sample_count", result.sampleCount)
+            .put("candidate_sample_count", result.candidateSampleCount)
+            .put("candidate_keyframe_count", result.candidateKeyframeCount)
+            .put("muxed_keyframe_count", result.muxedKeyframeCount)
+            .put("configured_bitrate", result.configuredBitRate)
+            .put("configured_keyframe_rate_fps", result.configuredKeyFrameRateFps)
+            .put("configured_i_frame_interval_us", result.configuredIFrameIntervalUs)
+            .put("active_ae_fps_range_lower", activeAeFpsRange()?.lower ?: JSONObject.NULL)
+            .put("active_ae_fps_range_upper", activeAeFpsRange()?.upper ?: JSONObject.NULL)
             .put("frame_selection_policy", result.frameSelectionPolicy)
             .put("all_intra", result.allIntra)
+            .put("muxed_first_is_keyframe", result.muxedFirstIsKeyframe)
             .put("requested_start_us", result.requestedStartUs)
             .put("requested_end_us", result.requestedEndUs)
+            .put("requested_duration_us", result.requestedDurationUs)
+            .put("phone_start_rx_elapsed_ns", result.phoneStartRxElapsedNs)
+            .put("phone_stop_rx_elapsed_ns", result.phoneStopRxElapsedNs)
+            .put("phone_rx_duration_us", result.phoneRxDurationUs)
+            .put("requested_minus_phone_rx_duration_us", result.requestedMinusPhoneRxDurationUs)
+            .put("trigger_clock_mapper_source", result.triggerClockMapperSource)
+            .put("trigger_clock_elapsed_minus_codec_us", result.triggerClockElapsedMinusCodecUs)
             .put("muxed_start_us", result.muxedStartUs)
             .put("muxed_end_us", result.muxedEndUs)
             .put("first_presentation_us", result.firstPresentationUs)
             .put("last_presentation_us", result.lastPresentationUs)
             .put("start_offset_error_us", result.muxedStartUs - result.requestedStartUs)
+            .put("chosen_start_offset_us", result.chosenStartOffsetUs)
+            .put("nearest_keyframe_before_start_offset_us", result.nearestKeyframeBeforeStartOffsetUs)
+            .put("nearest_keyframe_after_start_offset_us", result.nearestKeyframeAfterStartOffsetUs)
+            .put("skipped_sample_count_before_mux_start", result.skippedSampleCountBeforeMuxStart)
             .put("end_offset_error_us", result.muxedEndUs - result.requestedEndUs)
             .put("timestamp_source", result.timestampSource)
+            .put("actual_mux_selection_source", result.actualMuxSelectionSource)
+            .put("camera_time_mux_applied", result.cameraTimeMuxApplied)
+            .put("camera_time_selection_available", result.cameraTimeSelectionAvailable)
+            .put("camera_time_selection_trusted", result.cameraTimeSelectionTrusted)
+            .put("camera_time_untrusted_reason", result.cameraTimeUntrustedReason)
+            .put("camera_time_chosen_start_offset_us", result.cameraTimeChosenStartOffsetUs)
+            .put("camera_time_chosen_end_offset_us", result.cameraTimeChosenEndOffsetUs)
+            .put("camera_time_vs_codec_start_delta_us", result.cameraTimeVsCodecStartDeltaUs)
+            .put("camera_time_match_median_abs_us", result.cameraTimeMatchMedianAbsUs)
+            .put("camera_time_match_max_abs_us", result.cameraTimeMatchMaxAbsUs)
+            .put("camera_time_match_untrusted_count", result.cameraTimeMatchUntrustedCount)
+            .put("camera_time_matched_sample_count", result.cameraTimeMatchedSampleCount)
+            .put("camera_time_sensor_callback_fps", result.cameraTimeSensorCallbackFps)
+            .put("mux_duration_us", result.muxDurationUs)
+            .put("expected_fps_sample_count", result.expectedFpsSampleCount)
+            .put("encoded_big_gap_count", result.encodedBigGapCount)
+            .put("encoded_max_gap_us", result.encodedMaxGapUs)
+            .put("encoded_missing_frame_estimate", result.encodedMissingFrameEstimate)
+            .put("encoded_gap_positions", JSONArray(result.encodedGapPositions))
+            .put("final_written_sample_count", result.finalWrittenSampleCount)
+            .put("final_first_written_pts_us", result.finalFirstWrittenPtsUs)
+            .put("final_last_written_pts_us", result.finalLastWrittenPtsUs)
+            .put("final_cut_start_offset_us", result.finalCutStartOffsetUs)
+            .put("final_cut_end_offset_us", result.finalCutEndOffsetUs)
+            .put("final_cut_matches_selection", result.finalCutMatchesSelection)
+            .put("capture_started_count", captureStartedCount)
+            .put("capture_completed_count", captureCompletedCount)
+            .put("capture_failed_count", captureFailedCount)
+            .put("capture_buffer_lost_count", captureBufferLostCount)
+            .put("capture_sequence_aborted_count", captureSequenceAbortedCount)
+            .put("capture_sequence_completed_count", captureSequenceCompletedCount)
+            .put("last_capture_failure_reason", lastCaptureFailureReason)
+            .put("last_capture_buffer_lost_frame_number", lastCaptureBufferLostFrameNumber)
+        file.writeText(payload.toString(2), Charsets.UTF_8)
+    }
+
+    private fun writeCameraTimeDiagnosticsJson(payload: JSONObject, file: File) {
         file.writeText(payload.toString(2), Charsets.UTF_8)
     }
 
@@ -1253,7 +1590,7 @@ class CaptureCameraController(private val context: Context) {
             return
         }
 
-        listOf("mp4", "intrinsics.csv", "state.json", "segment.json").forEach { suffix ->
+        listOf("mp4", "intrinsics.csv", "state.json", "segment.json", "camera_time.json").forEach { suffix ->
             val oldFile = File(newDir, "$oldBase.$suffix")
             if (oldFile.exists()) {
                 oldFile.renameTo(File(newDir, "$newBase.$suffix"))
@@ -1451,15 +1788,10 @@ class CaptureCameraController(private val context: Context) {
     }
 
     private fun selectableHighSpeedFpsValues(range: Range<Int>): List<Int> {
-        val commonValues = listOf(60, 120, 240)
-        return buildSet {
-            add(range.upper)
-            commonValues.forEach { fps ->
-                if (fps in range.lower..range.upper) {
-                    add(fps)
-                }
-            }
-        }.filter { it > 30 }.sorted()
+        if (range.lower != range.upper || range.upper < MIN_EXPOSED_HIGH_SPEED_FPS) {
+            return emptyList()
+        }
+        return listOf(range.upper)
     }
 
     private fun selectableNormalFpsValues(ranges: Array<Range<Int>>, fallback: Int): List<Int> {
@@ -1672,16 +2004,21 @@ class CaptureCameraController(private val context: Context) {
         }, delayMs)
     }
 
-    private fun prepareArmedCapture(): ArmedCapture? {
+    private fun prepareArmedCapture(
+        useTimestampedInput: Boolean,
+        highSpeedTimestampedRequested: Boolean
+    ): ArmedCapture? {
         armedCapture?.let { return it }
         val id = cameraId ?: return null
         val (dir, base) = makeNewCaptureFolder()
         val videoFile = File(dir, "$base.mp4")
         val intrinsicsFile = File(dir, "$base.intrinsics.csv")
         val stateFile = File(dir, "$base.state.json")
+        val useSensorTimestampMapping =
+            selectedResolution.highSpeed && !useTimestampedInput && EXPERIMENT_HIGH_SPEED_SENSOR_TIMESTAMP_MAPPING
 
         val encoder = try {
-            createRollingVideoEncoder()
+            createRollingVideoEncoder(useTimestampedInput)
         } catch (error: Exception) {
             dir.deleteRecursively()
             lastArmFailureReason = formatProtocolError(error.message ?: "ENCODER_SETUP_FAILED")
@@ -1706,8 +2043,16 @@ class CaptureCameraController(private val context: Context) {
             stateFile = stateFile,
             encoder = encoder,
             encoderSurface = encoderSurface,
+            useTimestampedInput = useTimestampedInput,
+            highSpeedTimestampedRequested = highSpeedTimestampedRequested,
+            useSensorTimestampMapping = useSensorTimestampMapping,
             intrinsicCalibration = cameraCharacteristics(id).get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
-        ).also { armedCapture = it }
+        ).also {
+            lastEncoderTimestampedInput = useTimestampedInput
+            lastHighSpeedTimestampedRequested = highSpeedTimestampedRequested
+            lastEncoderSensorTimestampMapping = useSensorTimestampMapping
+            armedCapture = it
+        }
     }
 
     private fun discardArmedCapture(deleteFiles: Boolean = true) {
@@ -1728,5 +2073,13 @@ class CaptureCameraController(private val context: Context) {
                 cameraManager.getCameraCharacteristics(id)
             }
         }
+    }
+
+    companion object {
+        private const val EXPERIMENT_HIGH_SPEED_TIMESTAMPED_INPUT = false
+        private const val EXPERIMENT_HIGH_SPEED_SENSOR_TIMESTAMP_MAPPING = false
+        private const val HIGH_SPEED_ENCODER_ONLY_CAPTURE = true
+        private const val MIN_EXPOSED_HIGH_SPEED_FPS = 240
+        private const val HIGH_SPEED_INTRINSICS_SAMPLE_INTERVAL = 30
     }
 }

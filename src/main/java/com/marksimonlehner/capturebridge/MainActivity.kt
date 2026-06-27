@@ -369,7 +369,10 @@ private fun handleTcpCommand(
         }
         "START" -> {
             setStatus("Received START")
-            cameraController.startRecording(commandReceivedWallNs = phoneRxWallNs) { response ->
+            cameraController.startRecording(
+                commandReceivedWallNs = phoneRxWallNs,
+                commandReceivedElapsedNs = phoneRxNs
+            ) { response ->
                 tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
             }
         }
@@ -377,6 +380,7 @@ private fun handleTcpCommand(
             setStatus("Received STOP")
             cameraController.stopRecording(
                 commandReceivedWallNs = phoneRxWallNs,
+                commandReceivedElapsedNs = phoneRxNs,
                 onMarked = { response ->
                     tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
                 },
