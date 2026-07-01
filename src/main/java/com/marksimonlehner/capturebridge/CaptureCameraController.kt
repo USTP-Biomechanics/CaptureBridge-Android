@@ -2160,7 +2160,7 @@ class CaptureCameraController(private val context: Context) {
         private const val CAMERA_ERROR_RECOVERY_DELAY_MS = 750L
         private const val EXPERIMENT_HIGH_SPEED_TIMESTAMPED_INPUT = false
         private const val EXPERIMENT_HIGH_SPEED_SENSOR_TIMESTAMP_MAPPING = false
-        private const val HIGH_SPEED_ENCODER_ONLY_CAPTURE = true
+        private const val HIGH_SPEED_ENCODER_ONLY_CAPTURE = false
         private const val MIN_EXPOSED_HIGH_SPEED_FPS = 240
         private const val HIGH_SPEED_INTRINSICS_SAMPLE_INTERVAL = 30
     }

@@ -9,10 +9,14 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.SystemClock
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
@@ -38,6 +42,8 @@ private const val LIVE_PREVIEW_VERSION: Byte = 1
 data class LivePreviewStartRequest(
     val host: String,
     val port: Int,
+    val protocol: String,
+    val streamKey: String,
     val maxFps: Int,
     val jpegQuality: Int,
     val maxDimension: Int,
@@ -52,17 +58,27 @@ data class LivePreviewStartRequest(
 
             val host = objectValue.optString("host").trim()
             val port = objectValue.optInt("port", LIVE_PREVIEW_DEFAULT_PORT)
+            val protocol = objectValue.optString("protocol", "udp").trim().lowercase()
+            val streamKey = objectValue.optString("streamKey").trim()
             val maxFps = objectValue.optInt("maxFps", LIVE_PREVIEW_DEFAULT_FPS)
             val jpegQuality = objectValue.optInt("jpegQuality", LIVE_PREVIEW_DEFAULT_QUALITY)
             val maxDimension = objectValue.optInt("maxDimension", LIVE_PREVIEW_DEFAULT_MAX_DIMENSION)
 
-            if (host.isBlank() || port !in 1..65535 || maxFps < 0 || maxDimension < 0) {
+            if (
+                host.isBlank() ||
+                port !in 1..65535 ||
+                protocol !in setOf("udp", "tcp") ||
+                maxFps < 0 ||
+                maxDimension < 0
+            ) {
                 return null
             }
 
             return LivePreviewStartRequest(
                 host = host,
                 port = port,
+                protocol = protocol,
+                streamKey = streamKey,
                 maxFps = maxFps.coerceAtLeast(0),
                 jpegQuality = jpegQuality.coerceIn(20, 95),
                 maxDimension = maxDimension.coerceAtLeast(0),
@@ -143,6 +159,14 @@ class PhoneLivePreviewStreamer(
     }
 
     private fun runLoop(request: LivePreviewStartRequest, activeGeneration: Int) {
+        if (request.protocol == "tcp") {
+            runTcpLoop(request, activeGeneration)
+        } else {
+            runUdpLoop(request, activeGeneration)
+        }
+    }
+
+    private fun runUdpLoop(request: LivePreviewStartRequest, activeGeneration: Int) {
         var socket: DatagramSocket? = null
         try {
             val address = InetAddress.getByName(request.host)
@@ -151,7 +175,7 @@ class PhoneLivePreviewStreamer(
             stateCallback(
                 LivePreviewState(
                     active = true,
-                    message = "Streaming",
+                    message = "Streaming UDP",
                     host = request.host,
                     port = request.port,
                 )
@@ -196,6 +220,69 @@ class PhoneLivePreviewStreamer(
             }
         } finally {
             socket?.close()
+        }
+    }
+
+    private fun runTcpLoop(request: LivePreviewStartRequest, activeGeneration: Int) {
+        var socket: Socket? = null
+        try {
+            socket = Socket()
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress(request.host, request.port), 3_000)
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            output.write(("STREAM ${request.streamKey}\n").toByteArray(Charsets.UTF_8))
+            output.flush()
+            stateCallback(
+                LivePreviewState(
+                    active = true,
+                    message = "Streaming TCP",
+                    host = request.host,
+                    port = request.port,
+                )
+            )
+
+            val frameIntervalMs = if (request.maxFps > 0) {
+                max(1L, 1000L / request.maxFps.toLong())
+            } else {
+                0L
+            }
+            var nextFrameAt = SystemClock.elapsedRealtime()
+
+            while (running.get() && activeGeneration == generation.get()) {
+                val frame = capturePreviewFrame(request)
+                if (frame == null) {
+                    Thread.sleep(60)
+                    nextFrameAt = SystemClock.elapsedRealtime()
+                    continue
+                }
+
+                sendFrame(output, frame)
+
+                if (frameIntervalMs > 0L) {
+                    nextFrameAt += frameIntervalMs
+                    val sleepMs = nextFrameAt - SystemClock.elapsedRealtime()
+                    if (sleepMs > 0) {
+                        Thread.sleep(sleepMs)
+                    } else {
+                        nextFrameAt = SystemClock.elapsedRealtime()
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            if (activeGeneration == generation.get()) {
+                stateCallback(
+                    LivePreviewState(
+                        active = false,
+                        message = "Stream error",
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                )
+            }
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -364,9 +451,27 @@ class PhoneLivePreviewStreamer(
         port: Int,
         frame: CapturedPreviewFrame,
     ) {
+        for (packetBytes in buildFramePackets(frame)) {
+            socket.send(DatagramPacket(packetBytes, packetBytes.size, address, port))
+        }
+    }
+
+    private fun sendFrame(
+        output: DataOutputStream,
+        frame: CapturedPreviewFrame,
+    ) {
+        for (packetBytes in buildFramePackets(frame)) {
+            output.writeInt(packetBytes.size)
+            output.write(packetBytes)
+        }
+        output.flush()
+    }
+
+    private fun buildFramePackets(frame: CapturedPreviewFrame): List<ByteArray> {
         val frameId = nextFrameId.getAndIncrement()
         val totalBytes = frame.jpegBytes.size
         val chunkCount = max(1, (totalBytes + LIVE_PREVIEW_MAX_PACKET_PAYLOAD - 1) / LIVE_PREVIEW_MAX_PACKET_PAYLOAD)
+        val packets = ArrayList<ByteArray>(chunkCount)
 
         for (chunkIndex in 0 until chunkCount) {
             val start = chunkIndex * LIVE_PREVIEW_MAX_PACKET_PAYLOAD
@@ -388,9 +493,9 @@ class PhoneLivePreviewStreamer(
             packetBuffer.putLong(frame.timestampMs)
             packetBuffer.put(frame.jpegBytes, start, payloadSize)
 
-            val packetBytes = packetBuffer.array()
-            socket.send(DatagramPacket(packetBytes, packetBytes.size, address, port))
+            packets.add(packetBuffer.array())
         }
+        return packets
     }
 }
 
