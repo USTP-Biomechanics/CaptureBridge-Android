@@ -31,6 +31,12 @@ sealed class ConnectionState {
     data class Failed(val message: String) : ConnectionState()
 }
 
+enum class ConnectionTransport(val protocolValue: String) {
+    UsbAdbReverse("usb_adb_reverse"),
+    WifiDiscovery("wifi"),
+    DirectHost("direct")
+}
+
 class TcpController(private val context: Context) {
     data class TransferFile(
         val file: File,
@@ -59,7 +65,13 @@ class TcpController(private val context: Context) {
     private var discoveryOnResolved: ((String) -> Unit)? = null
     private var reconnectFuture: ScheduledFuture<*>? = null
 
-    fun connect(host: String, port: Int, preferDiscovery: Boolean = false, quietRetry: Boolean = false) {
+    fun connect(
+        host: String,
+        port: Int,
+        preferDiscovery: Boolean = false,
+        quietRetry: Boolean = false,
+        transport: ConnectionTransport = ConnectionTransport.DirectHost
+    ) {
         this.preferDiscovery = preferDiscovery
         lastHost = host
         lastPort = port
@@ -81,7 +93,14 @@ class TcpController(private val context: Context) {
                 }
                 socket = nextSocket
                 updateState(ConnectionState.Connected)
-                sendHello()
+                postDiscoveryStatus(
+                    when (transport) {
+                        ConnectionTransport.UsbAdbReverse -> "Connected via USB"
+                        ConnectionTransport.WifiDiscovery -> "Connected via Wi-Fi"
+                        ConnectionTransport.DirectHost -> "Connected"
+                    }
+                )
+                sendHello(transport, host)
                 receiveLoop(nextSocket, connectGeneration)
             } catch (error: Exception) {
                 if (connectGeneration == generation.get()) {
@@ -110,10 +129,17 @@ class TcpController(private val context: Context) {
             postDiscoveryStatus("Waiting for hub...")
         } else {
             updateState(ConnectionState.Connecting)
-            postDiscoveryStatus("Discovering...")
+            postDiscoveryStatus("Trying USB...")
         }
 
+        val connectGeneration = generation.get()
         connectExecutor.execute {
+            if (tryUsbReverseConnection(port, quietRetry, connectGeneration)) {
+                return@execute
+            }
+            if (!quietRetry) {
+                postDiscoveryStatus("USB unavailable, discovering Wi-Fi...")
+            }
             try {
                 DatagramSocket(null).use { udp ->
                     udp.reuseAddress = true
@@ -141,10 +167,18 @@ class TcpController(private val context: Context) {
                     val resolvedPort = parts.getOrNull(1)?.toIntOrNull() ?: port
                     postDiscoveryStatus("Discovery OK")
                     mainHandler.post { discoveryOnResolved?.invoke(resolvedHost) }
-                    connect(resolvedHost, resolvedPort, preferDiscovery = true, quietRetry = quietRetry)
+                    connect(
+                        resolvedHost,
+                        resolvedPort,
+                        preferDiscovery = true,
+                        quietRetry = quietRetry,
+                        transport = ConnectionTransport.WifiDiscovery
+                    )
                 }
             } catch (_: SocketTimeoutException) {
-                tryUsbReverseFallback(port, quietRetry)
+                postDiscoveryStatus("Waiting for hub...")
+                updateState(ConnectionState.Idle)
+                scheduleReconnectIfNeeded()
             } catch (error: Exception) {
                 if (quietRetry) {
                     postDiscoveryStatus("Waiting for hub...")
@@ -237,8 +271,10 @@ class TcpController(private val context: Context) {
         }
     }
 
-    private fun sendHello() {
+    private fun sendHello(transport: ConnectionTransport, host: String) {
         sendLine("HELLO ${deviceDisplayName()}")
+        val hostField = host.replace('\n', ' ').trim()
+        sendLine("TRANSPORT ${transport.protocolValue} host=$hostField")
     }
 
     private fun sendLineBlocking(text: String) {
@@ -280,24 +316,28 @@ class TcpController(private val context: Context) {
         }, 1, TimeUnit.SECONDS)
     }
 
-    private fun tryUsbReverseFallback(port: Int, quietRetry: Boolean) {
+    private fun tryUsbReverseConnection(port: Int, quietRetry: Boolean, connectGeneration: Int): Boolean {
         if (!quietRetry) {
-            postDiscoveryStatus("Discovery timeout, trying USB reverse...")
+            postDiscoveryStatus("Trying USB...")
         }
         try {
             val host = "127.0.0.1"
             val nextSocket = Socket()
             nextSocket.tcpNoDelay = true
             nextSocket.connect(InetSocketAddress(host, port), 500)
+            if (connectGeneration != generation.get()) {
+                nextSocket.close()
+                return true
+            }
             socket = nextSocket
             mainHandler.post { discoveryOnResolved?.invoke(host) }
             updateState(ConnectionState.Connected)
-            sendHello()
+            postDiscoveryStatus("Connected via USB")
+            sendHello(ConnectionTransport.UsbAdbReverse, host)
             receiveLoop(nextSocket, generation.get())
+            return true
         } catch (_: Exception) {
-            postDiscoveryStatus("Waiting for hub...")
-            updateState(ConnectionState.Idle)
-            scheduleReconnectIfNeeded()
+            return false
         }
     }
 

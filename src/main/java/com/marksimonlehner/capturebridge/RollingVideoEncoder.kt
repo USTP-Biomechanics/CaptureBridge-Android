@@ -287,17 +287,19 @@ class RollingVideoEncoder(
     fun beginSegment(
         commandReceivedWallNs: Long? = null,
         commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null,
         cameraLeadUs: Long = 0L
     ): Long {
         val startUs = synchronized(lock) {
             closeSegmentSpoolLocked(deleteFile = true)
             segmentSamples.clear()
             segmentCameraLeadUs = cameraLeadUs
-            diagnosticRequestedStartElapsedUs = commandReceivedElapsedNs?.let { it / 1000L }
+            val requestedElapsedNs = targetElapsedNs ?: commandReceivedElapsedNs
+            diagnosticRequestedStartElapsedUs = requestedElapsedNs?.let { it / 1000L }
             diagnosticRequestedEndElapsedUs = null
             requestedStartUs = estimatePresentationUsAtWallNsLocked(
                 wallNs = commandReceivedWallNs,
-                elapsedNs = commandReceivedElapsedNs
+                elapsedNs = requestedElapsedNs
             ) + segmentCameraLeadUs
             requestedEndUs = Long.MAX_VALUE
             segmentFile = File.createTempFile("capturebridge_segment_", ".h264buf", tempDir)
@@ -317,12 +319,17 @@ class RollingVideoEncoder(
         return startUs
     }
 
-    fun endSegment(commandReceivedWallNs: Long? = null, commandReceivedElapsedNs: Long? = null): Long {
+    fun endSegment(
+        commandReceivedWallNs: Long? = null,
+        commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null
+    ): Long {
         val endUs = synchronized(lock) {
-            diagnosticRequestedEndElapsedUs = commandReceivedElapsedNs?.let { it / 1000L }
+            val requestedElapsedNs = targetElapsedNs ?: commandReceivedElapsedNs
+            diagnosticRequestedEndElapsedUs = requestedElapsedNs?.let { it / 1000L }
             requestedEndUs = estimatePresentationUsAtWallNsLocked(
                 wallNs = commandReceivedWallNs,
-                elapsedNs = commandReceivedElapsedNs
+                elapsedNs = requestedElapsedNs
             ) + segmentCameraLeadUs
             requestedEndUs
         }
@@ -1006,6 +1013,9 @@ class RollingVideoEncoder(
                 return referenceNs / 1000L
             }
             throw IllegalStateException("Timestamped encoder input is not ready")
+        }
+        if (useTimestampedInput) {
+            return (elapsedNs ?: SystemClock.elapsedRealtimeNanos()) / 1000L
         }
         val referenceNs = wallNs ?: System.nanoTime()
         val elapsedUs = (referenceNs - latestInputWallNs) / 1000L

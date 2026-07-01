@@ -141,7 +141,7 @@ private fun CaptureBridgeScreen(
     LaunchedEffect(hasCameraPermission) {
         if (hasCameraPermission) {
             cameraController.start()
-            statusText = "Discovering..."
+            statusText = "Trying USB..."
             tcpController.discoverAndConnect(SERVER_PORT) { resolvedIp ->
                 serverIp = resolvedIp
             }
@@ -210,7 +210,7 @@ private fun CaptureBridgeScreen(
                     }
                     Button(
                         onClick = {
-                            statusText = "Discovering..."
+                            statusText = "Trying USB..."
                             tcpController.discoverAndConnect(SERVER_PORT) { resolvedIp ->
                                 serverIp = resolvedIp
                             }
@@ -359,6 +359,17 @@ private fun handleTcpCommand(
         "PING" -> {
             tcpController.sendLine(withPhoneTiming("PONG $payload phone_elapsed_ns=${SystemClock.elapsedRealtimeNanos()}", phoneRxNs))
         }
+        "SYNC" -> {
+            val fields = parseProtocolFields(payload)
+            val seq = payload.trim().split(Regex("\\s+")).firstOrNull()?.toLongOrNull()
+                ?: fields["seq"]?.toLongOrNull()
+                ?: -1L
+            val hubTxNs = fields["hub_tx_ns"]?.toLongOrNull() ?: -1L
+            tcpController.sendLine(
+                "SYNC_OK seq=$seq hub_tx_ns=$hubTxNs " +
+                    "phone_rx_ns=$phoneRxNs phone_tx_ns=${SystemClock.elapsedRealtimeNanos()}"
+            )
+        }
         "PREPARE", "ARM" -> {
             setStatus("Received $head")
             parsePrerollMs(payload)?.let { cameraController.setPrerollFromTCP(it) }
@@ -372,6 +383,21 @@ private fun handleTcpCommand(
             cameraController.startRecording(
                 commandReceivedWallNs = phoneRxWallNs,
                 commandReceivedElapsedNs = phoneRxNs
+            ) { response ->
+                tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+            }
+        }
+        "START_AT" -> {
+            val targetElapsedNs = parsePhoneElapsedNs(payload)
+            if (targetElapsedNs == null) {
+                tcpController.sendLine(withPhoneTiming("START_ERR BAD_TARGET", phoneRxNs))
+                return
+            }
+            setStatus("Received START_AT")
+            cameraController.startRecording(
+                commandReceivedWallNs = phoneRxWallNs,
+                commandReceivedElapsedNs = phoneRxNs,
+                targetElapsedNs = targetElapsedNs
             ) { response ->
                 tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
             }
@@ -391,6 +417,31 @@ private fun handleTcpCommand(
                     tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
                 }
             )
+        }
+        "STOP_AT" -> {
+            val targetElapsedNs = parsePhoneElapsedNs(payload)
+            if (targetElapsedNs == null) {
+                tcpController.sendLine(withPhoneTiming("STOP_ERR BAD_TARGET", phoneRxNs))
+                return
+            }
+            setStatus("Received STOP_AT")
+            val delayMs = ((targetElapsedNs - SystemClock.elapsedRealtimeNanos()) / 1_000_000L).coerceAtLeast(0L)
+            Handler(Looper.getMainLooper()).postDelayed({
+                cameraController.stopRecording(
+                    commandReceivedWallNs = phoneRxWallNs,
+                    commandReceivedElapsedNs = phoneRxNs,
+                    targetElapsedNs = targetElapsedNs,
+                    onMarked = { response ->
+                        tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                    },
+                    onReady = { response ->
+                        tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                    },
+                    completion = { response ->
+                        tcpController.sendLine(withPhoneTiming(response, phoneRxNs))
+                    }
+                )
+            }, delayMs)
         }
         "LIST" -> {
             tcpController.sendLine("LIST_OK ${cameraController.buildCaptureListJSON()}")
@@ -476,6 +527,35 @@ private fun handleTcpCommand(
 
 private fun withPhoneTiming(response: String, phoneRxNs: Long): String =
     "$response phone_rx_ns=$phoneRxNs phone_tx_ns=${SystemClock.elapsedRealtimeNanos()}"
+
+private fun parseProtocolFields(payload: String): Map<String, String> =
+    payload.trim().split(Regex("\\s+"))
+        .filter { it.contains("=") }
+        .mapNotNull { token ->
+            val index = token.indexOf('=')
+            if (index <= 0) {
+                null
+            } else {
+                token.substring(0, index) to token.substring(index + 1)
+            }
+        }
+        .toMap()
+
+private fun parsePhoneElapsedNs(payload: String): Long? {
+    val text = payload.trim()
+    if (text.isEmpty()) {
+        return null
+    }
+    return try {
+        if (text.startsWith("{")) {
+            JSONObject(text).optLong("phone_elapsed_ns", -1L).takeIf { it > 0L }
+        } else {
+            parseProtocolFields(text)["phone_elapsed_ns"]?.toLongOrNull()?.takeIf { it > 0L }
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
 
 private fun parsePrerollMs(payload: String): Long? {
     val text = payload.trim()

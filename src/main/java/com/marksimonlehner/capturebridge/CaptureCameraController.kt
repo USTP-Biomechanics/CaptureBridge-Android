@@ -23,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
@@ -401,6 +402,7 @@ class CaptureCameraController(private val context: Context) {
     fun startRecording(
         commandReceivedWallNs: Long? = null,
         commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null,
         completion: (String) -> Unit = {}
     ) {
         val handler = backgroundHandler
@@ -408,7 +410,7 @@ class CaptureCameraController(private val context: Context) {
             completion("START_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { startRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, completion) }
+        handler.post { startRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, targetElapsedNs, completion) }
     }
 
     fun prepareForRecording(completion: (String) -> Unit = {}) {
@@ -423,6 +425,7 @@ class CaptureCameraController(private val context: Context) {
     fun stopRecording(
         commandReceivedWallNs: Long? = null,
         commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null,
         onMarked: (String) -> Unit = {},
         onReady: (String) -> Unit = {},
         completion: (String) -> Unit = {}
@@ -432,7 +435,7 @@ class CaptureCameraController(private val context: Context) {
             completion("STOP_ERR NO_CAMERA_THREAD")
             return
         }
-        handler.post { stopRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, onMarked, onReady, completion) }
+        handler.post { stopRecordingInternal(commandReceivedWallNs, commandReceivedElapsedNs, targetElapsedNs, onMarked, onReady, completion) }
     }
 
     fun transferBusyReason(): String? {
@@ -706,30 +709,71 @@ class CaptureCameraController(private val context: Context) {
         publishSettings()
 
         try {
+            Log.i(
+                CAMERA_LOG_TAG,
+                "Opening camera id=$id ${selectedResolution.width}x${selectedResolution.height}@${selectedResolution.maxFps} " +
+                    "highSpeed=${selectedResolution.highSpeed} recording=$recording armed=$captureSessionArmed"
+            )
             cameraManager.openCamera(
                 id,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
+                        Log.i(CAMERA_LOG_TAG, "Camera opened id=$id")
                         cameraDevice = camera
                         recreateIdleSession(clearArm = true, forceArm = selectedResolution.highSpeed)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
+                        Log.w(CAMERA_LOG_TAG, "Camera disconnected id=$id recording=$recording")
                         camera.close()
                         cameraDevice = null
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
+                        val errorName = cameraErrorName(error)
+                        Log.e(
+                            CAMERA_LOG_TAG,
+                            "Camera error id=$id error=$errorName($error) recording=$recording armed=$captureSessionArmed"
+                        )
                         camera.close()
                         cameraDevice = null
-                        setError("Camera error $error")
+                        setError("Camera error $errorName ($error)")
+                        recoverCameraAfterDeviceError(error)
                     }
                 },
                 backgroundHandler
             )
         } catch (error: CameraAccessException) {
+            Log.e(CAMERA_LOG_TAG, "Camera access failed while opening id=$id", error)
             setError(error.message ?: "Camera access failed")
         }
+    }
+
+    private fun cameraErrorName(error: Int): String =
+        when (error) {
+            CameraDevice.StateCallback.ERROR_CAMERA_IN_USE -> "ERROR_CAMERA_IN_USE"
+            CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "ERROR_MAX_CAMERAS_IN_USE"
+            CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "ERROR_CAMERA_DISABLED"
+            CameraDevice.StateCallback.ERROR_CAMERA_DEVICE -> "ERROR_CAMERA_DEVICE"
+            CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "ERROR_CAMERA_SERVICE"
+            else -> "ERROR_UNKNOWN"
+        }
+
+    private fun recoverCameraAfterDeviceError(error: Int) {
+        if (recording) {
+            Log.e(CAMERA_LOG_TAG, "Camera error ${cameraErrorName(error)} happened while recording; manual capture recovery required")
+            return
+        }
+        val handler = backgroundHandler ?: return
+        closeCaptureSession()
+        discardArmedCapture()
+        Log.w(CAMERA_LOG_TAG, "Scheduling camera recovery after ${cameraErrorName(error)}")
+        handler.postDelayed({
+            if (!recording && cameraDevice == null) {
+                Log.i(CAMERA_LOG_TAG, "Attempting camera recovery reopen")
+                openCameraInternal()
+            }
+        }, CAMERA_ERROR_RECOVERY_DELAY_MS)
     }
 
     private fun recreateIdleSession(
@@ -931,6 +975,7 @@ class CaptureCameraController(private val context: Context) {
     private fun startRecordingInternal(
         commandReceivedWallNs: Long? = null,
         commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null,
         completion: (String) -> Unit = {}
     ) {
         val requestBeginNs = SystemClock.elapsedRealtimeNanos()
@@ -962,6 +1007,7 @@ class CaptureCameraController(private val context: Context) {
                 requestBeginNs = requestBeginNs,
                 commandReceivedWallNs = commandReceivedWallNs,
                 commandReceivedElapsedNs = commandReceivedElapsedNs,
+                targetElapsedNs = targetElapsedNs,
                 completion = completion
             )
             return
@@ -986,6 +1032,7 @@ class CaptureCameraController(private val context: Context) {
                 requestBeginNs = requestBeginNs,
                 commandReceivedWallNs = commandReceivedWallNs,
                 commandReceivedElapsedNs = commandReceivedElapsedNs,
+                targetElapsedNs = targetElapsedNs,
                 completion = completion
             )
         }
@@ -997,6 +1044,7 @@ class CaptureCameraController(private val context: Context) {
         requestBeginNs: Long,
         commandReceivedWallNs: Long?,
         commandReceivedElapsedNs: Long?,
+        targetElapsedNs: Long?,
         completion: (String) -> Unit
     ) {
         frameIndex = 0
@@ -1017,9 +1065,20 @@ class CaptureCameraController(private val context: Context) {
             val requestedStartUs = activeEncoder?.beginSegment(
                 commandReceivedWallNs = commandReceivedWallNs,
                 commandReceivedElapsedNs = commandReceivedElapsedNs,
+                targetElapsedNs = targetElapsedNs,
                 cameraLeadUs = cameraLeadUs
             )
             val requestMarkedNs = SystemClock.elapsedRealtimeNanos()
+            val targetDeltaMs = if (targetElapsedNs != null && commandReceivedElapsedNs != null) {
+                (commandReceivedElapsedNs - targetElapsedNs) / 1_000_000.0
+            } else {
+                0.0
+            }
+            val handlerDeltaMs = if (targetElapsedNs != null) {
+                (requestBeginNs - targetElapsedNs) / 1_000_000.0
+            } else {
+                0.0
+            }
             warmingUp.set(false)
             recording = true
             _uiState.update { it.copy(isRecording = true, lastError = null) }
@@ -1029,6 +1088,9 @@ class CaptureCameraController(private val context: Context) {
                     "phone_start_begin_ns=$requestBeginNs " +
                     "phone_start_marked_ns=$requestMarkedNs " +
                     "phone_start_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
+                    "target_phone_elapsed_ns=${targetElapsedNs ?: -1L} " +
+                    "target_delta_ms=$targetDeltaMs " +
+                    "handler_delta_ms=$handlerDeltaMs " +
                     "requested_start_us=${requestedStartUs ?: -1L} " +
                     "encoder_timestamped_input=${activeEncoderTimestampedInput()} " +
                     "highspeed_timestamped_requested=${activeHighSpeedTimestampedRequested()} " +
@@ -1067,6 +1129,7 @@ class CaptureCameraController(private val context: Context) {
     private fun stopRecordingInternal(
         commandReceivedWallNs: Long? = null,
         commandReceivedElapsedNs: Long? = null,
+        targetElapsedNs: Long? = null,
         onMarked: (String) -> Unit = {},
         onReady: (String) -> Unit = {},
         completion: (String) -> Unit = {}
@@ -1092,10 +1155,21 @@ class CaptureCameraController(private val context: Context) {
         var requestedEndUs: Long? = null
         var segmentMarkedNs: Long? = null
         var muxDoneNs: Long? = null
+        val targetDeltaMs = if (targetElapsedNs != null && commandReceivedElapsedNs != null) {
+            (commandReceivedElapsedNs - targetElapsedNs) / 1_000_000.0
+        } else {
+            0.0
+        }
+        val handlerDeltaMs = if (targetElapsedNs != null) {
+            (requestBeginNs - targetElapsedNs) / 1_000_000.0
+        } else {
+            0.0
+        }
         try {
             requestedEndUs = encoder?.endSegment(
                 commandReceivedWallNs = commandReceivedWallNs,
-                commandReceivedElapsedNs = commandReceivedElapsedNs
+                commandReceivedElapsedNs = commandReceivedElapsedNs,
+                targetElapsedNs = targetElapsedNs
             )
             segmentMarkedNs = SystemClock.elapsedRealtimeNanos()
             onMarked(
@@ -1103,6 +1177,9 @@ class CaptureCameraController(private val context: Context) {
                     "phone_stop_begin_ns=$requestBeginNs " +
                     "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
                     "phone_stop_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
+                    "target_phone_elapsed_ns=${targetElapsedNs ?: -1L} " +
+                    "target_delta_ms=$targetDeltaMs " +
+                    "handler_delta_ms=$handlerDeltaMs " +
                     "requested_end_us=${requestedEndUs ?: -1L}"
             )
             if (encoder != null && videoFile != null) {
@@ -1146,6 +1223,9 @@ class CaptureCameraController(private val context: Context) {
                     "phone_stop_marked_ns=${segmentMarkedNs ?: -1L} " +
                     "phone_stop_mux_done_ns=${muxDoneNs ?: -1L} " +
                     "phone_stop_rx_elapsed_ns=${commandReceivedElapsedNs ?: -1L} " +
+                    "target_phone_elapsed_ns=${targetElapsedNs ?: -1L} " +
+                    "target_delta_ms=$targetDeltaMs " +
+                    "handler_delta_ms=$handlerDeltaMs " +
                     "requested_end_us=${requestedEndUs ?: -1L}"
             )
         } else {
@@ -2076,6 +2156,8 @@ class CaptureCameraController(private val context: Context) {
     }
 
     companion object {
+        private const val CAMERA_LOG_TAG = "CaptureBridgeCamera"
+        private const val CAMERA_ERROR_RECOVERY_DELAY_MS = 750L
         private const val EXPERIMENT_HIGH_SPEED_TIMESTAMPED_INPUT = false
         private const val EXPERIMENT_HIGH_SPEED_SENSOR_TIMESTAMP_MAPPING = false
         private const val HIGH_SPEED_ENCODER_ONLY_CAPTURE = true
