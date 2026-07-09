@@ -1,11 +1,11 @@
 # CaptureBridge Android
 
-CaptureBridge is a local-network acquisition system for smartphone-based
+CaptureBridge is a local or USB-connected acquisition system for smartphone-based
 markerless motion-analysis workflows. CaptureBridge Android is the phone-side
 recording client: it discovers CaptureBridge Hub on a local Wi-Fi or LAN
-network, receives session names and camera settings from the Hub, records video
-on the phone, streams live preview when requested, and sends completed captures
-back to the Windows host.
+network or connects through USB/ADB reverse forwarding, receives session names
+and camera settings from the Hub, records video on the phone, streams live
+preview when requested, and sends completed captures back to the Windows host.
 
 The goal is repeatable acquisition, not a locked-in analysis algorithm. The app
 stores organized phone videos and metadata that can be used downstream with
@@ -26,12 +26,16 @@ use this Android repository when building or modifying the phone client.
 ## Main Features
 
 - UDP discovery of CaptureBridge Hub on the local network
-- TCP control connection to the Hub on port `6000`
+- TCP control connection to the Hub on port `6000`, either through USB/ADB
+  reverse forwarding or Wi-Fi/LAN discovery
 - Centralized `NAME`, `START`, and `STOP` control from CaptureBridge Hub
+- Scheduled `START_AT` and `STOP_AT` commands when Hub/phone time sync is
+  available
 - Android Camera2 camera capability reporting
 - Remote camera setting requests for resolution, frame rate, ISO, and shutter
   time where supported by the phone
-- Raw live preview streaming to the Hub over UDP `6101`
+- Raw live preview streaming to the Hub over UDP `6101` or TCP through USB/ADB
+  reverse forwarding
 - Pre-armed H.264 MP4 recording through Android `MediaCodec`
 - Rolling encoded video buffer with configurable preroll before the Hub's
   `START` command
@@ -42,6 +46,8 @@ use this Android repository when building or modifying the phone client.
   - `.mp4` video
   - `.intrinsics.csv` frame-level camera metadata where available
   - `.state.json` capture, device, and camera settings metadata
+  - `.segment.json` segment trimming and muxing metadata
+  - `.camera_time.json` camera/encoder timing diagnostics when available
 - Capture listing, selected-capture transfer, all-capture transfer, selected
   delete, and delete-all commands from the Hub
 - Front/back camera switching when not recording
@@ -53,10 +59,12 @@ use this Android repository when building or modifying the phone client.
 - For building from source: Android SDK Platform 36.1 and Android SDK
   Build-Tools 36.1.0
 - CaptureBridge Hub running on a Windows computer
-- Phone and Windows computer on the same private Wi-Fi or LAN
-- Local network access to TCP/UDP port `6000`
-- For live preview, outbound UDP from the phone to the Hub stream port, `6101`
-  by default
+- USB debugging enabled and authorized for USB/ADB reverse use, or phone and
+  Windows computer on the same private Wi-Fi or LAN
+- For Wi-Fi/LAN use, local network access to TCP/UDP port `6000`
+- For Wi-Fi live preview, outbound UDP from the phone to the Hub stream port,
+  `6101` by default; for USB preview, the Hub requests TCP preview through ADB
+  reverse forwarding
 
 High frame rates depend on the phone. The app reports available modes through
 Camera2, and the Hub should choose a mode supported by all connected phones.
@@ -96,8 +104,8 @@ release APK produced by the normal Gradle or GitHub Actions release workflow.
 
 Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.
-The app also needs local network access so it can discover and connect to the
-Hub.
+The app also needs local network access for Wi-Fi discovery, or USB debugging
+authorization when connecting through USB/ADB reverse.
 
 Permissions used:
 
@@ -110,19 +118,24 @@ private storage and are transferred only when the Hub sends a transfer command.
 
 ## Operator Workflow
 
-1. Put the Windows host and all Android phones on the same private network.
+1. Connect Android phones by USB with USB debugging enabled, or put the Windows
+   host and all Android phones on the same private network.
 2. Start CaptureBridge Hub on the Windows host.
 3. Launch CaptureBridge Android on each phone.
 4. Allow camera permission if prompted.
-5. Wait for the app to discover and connect to the Hub.
+5. Wait for the app to try USB first and then discover/connect to the Hub over
+   Wi-Fi if USB is unavailable.
 6. Confirm the phones appear in the Hub.
 7. Configure the capture name and camera settings in the Hub.
 8. Let the Hub prepare/arm the phones when it sends the capture name or an
    explicit `PREPARE`/`ARM` command. While armed, the phone keeps a rolling
    encoded buffer so the capture can include a short preroll before `START`.
 9. Press `START` in the Hub to mark the segment start on all connected phones.
+   When clock samples are good enough, the Hub may send `START_AT` so the phone
+   starts at a scheduled elapsed-time target.
 10. Press `STOP` in the Hub to mark the segment end and finalize the trimmed
-   MP4 file.
+   MP4 file. When clock samples are good enough, the Hub may send `STOP_AT` so
+   the phone stops at a scheduled elapsed-time target.
 11. Transfer the current capture or all captures from the Hub.
 12. Use the Hub's stream checkboxes when live phone preview is needed.
 
@@ -131,7 +144,8 @@ label, camera settings, and transfer state.
 
 ## Network Protocol Summary
 
-The app searches for CaptureBridge Hub by broadcasting:
+The app first tries USB/ADB reverse connection to local TCP `6000`. If that is
+not available, it searches for CaptureBridge Hub by broadcasting:
 
 ```text
 DISCOVER_UDPCAMERA
@@ -143,19 +157,24 @@ The Hub replies with:
 UDPCAMERA_OK 6000
 ```
 
-After discovery, the Android app opens a TCP connection to the Hub and sends:
+After connecting, the Android app sends:
 
 ```text
 HELLO <device_name>
+TRANSPORT <usb_adb_reverse|wifi|direct> host=<host>
 ```
 
 Supported Hub commands include:
 
 - `NAME <capture_label>`
+- `PING <payload>`
+- `SYNC <seq> hub_tx_ns=<ns>`
 - `PREPARE [<preroll_ms>|<json>]`
 - `ARM [<preroll_ms>|<json>]`
 - `START`
+- `START_AT phone_elapsed_ns=<ns>`
 - `STOP`
+- `STOP_AT phone_elapsed_ns=<ns>`
 - `LIST`
 - `SETTINGS_LIST`
 - `SETTINGS <json>`
@@ -166,14 +185,22 @@ Supported Hub commands include:
 - `LIVE_PREVIEW_START <json>`
 - `LIVE_PREVIEW_STOP`
 
+`LIVE_PREVIEW_START` includes `host`, `port`, `protocol`, `maxFps`,
+`jpegQuality`, `maxDimension`, and optionally `streamKey`. The preview protocol
+is `udp` for Wi-Fi/LAN and `tcp` when the Hub routes preview through USB/ADB
+reverse forwarding.
+
 Common Android responses include:
 
 - `NAME_OK`
+- `PONG <payload> phone_elapsed_ns=<ns> phone_rx_ns=<ns> phone_tx_ns=<ns>`
+- `SYNC_OK seq=<seq> hub_tx_ns=<ns> phone_rx_ns=<ns> phone_tx_ns=<ns>`
 - `PREPARE_OK READY preroll_ms=<ms> camera_lead_ms=<ms>`
-- `START_OK`
-- `STOP_MARKED ROLLING_BUFFER`
-- `STOP_OK`
-- `READY PREVIEW`
+- `START_OK ROLLING_BUFFER ...`
+- `STOP_MARKED ROLLING_BUFFER ...`
+- `STOP_OK MEDIACODEC_MUXED ...`
+- `READY PREVIEW` or `READY ARMED`
+- `READY_ERR <reason>`
 - `LIST_OK <json>`
 - `SETTINGS_LIST_OK <json>`
 - `SETTINGS_OK <json>`
@@ -191,6 +218,11 @@ Common Android responses include:
 - `ERR_UNKNOWN <command>`
 - `LIVE_PREVIEW_STATE <json|text>`
 
+Responses to timing-sensitive commands include `phone_rx_ns` and `phone_tx_ns`.
+The Hub uses those fields to summarize phone receive-to-transmit time and to
+maintain background `SYNC` samples for scheduled `START_AT` / `STOP_AT`
+commands.
+
 ## Capture Output
 
 Captures are stored in the app's private `Captures` directory. A finalized
@@ -201,12 +233,18 @@ device identifier. Typical files are:
 <capture_name>/<capture_name>.mp4
 <capture_name>/<capture_name>.intrinsics.csv
 <capture_name>/<capture_name>.state.json
+<capture_name>/<capture_name>.segment.json
+<capture_name>/<capture_name>.camera_time.json
 ```
 
 The intrinsics CSV contains frame index, relative timestamp, camera matrix
 fields where available, lens position, exposure time, ISO, and zoom. The state
 JSON stores device, camera, resolution, frame-rate, shutter, ISO, manual-sensor
-support, orientation, and platform information.
+support, orientation, platform information, and the active timing/muxing
+backend. The segment JSON records requested start/end timing, selected mux
+frame offsets, keyframe selection, phone receive duration, and related trim
+diagnostics. Camera-time diagnostics are written when the active backend has
+camera/encoder timestamp information to report.
 
 The current recording backend pre-arms a `MediaCodec` H.264 encoder before the
 Hub starts a capture. Encoded samples are retained in a rolling in-memory buffer
@@ -220,21 +258,23 @@ selection policy.
 ## Synchronization Note
 
 CaptureBridge coordinates acquisition by sending prepare, start, and stop
-commands over a local WLAN/TCP connection. The Android app pre-arms the camera
-pipeline and returns phone-side receive/transmit timing fields on key command
-responses, which helps inspect command timing and trim the saved MP4 around the
-requested segment. This is useful for near-simultaneous recording and structured
-multi-device acquisition, but this version does not claim measured frame-level
-synchronization. Studies that require frame-accurate timing should validate
-timing with an external optical or electronic reference.
+commands over USB/ADB reverse or a local WLAN/TCP connection. The Android app
+pre-arms the camera pipeline and returns phone-side receive/transmit timing
+fields on key command responses. The Hub also exchanges background `SYNC`
+samples and can use `START_AT` / `STOP_AT` for scheduled phone-clock segment
+marks when the sync estimate is usable. This helps inspect command timing and
+trim the saved MP4 around the requested segment, but this version does not claim
+measured frame-level synchronization. Studies that require frame-accurate timing
+should validate timing with an external optical or electronic reference.
 
 ## Troubleshooting
 
 ### The phone does not connect
 
 - Confirm CaptureBridge Hub is running.
-- Confirm phone and PC are on the same private Wi-Fi or LAN.
-- Confirm the Windows firewall allows UDP `6000` and TCP `6000`.
+- For USB, confirm USB debugging is enabled and authorized.
+- For Wi-Fi, confirm phone and PC are on the same private Wi-Fi or LAN.
+- For Wi-Fi, confirm the Windows firewall allows UDP `6000` and TCP `6000`.
 - Disable VPNs, guest Wi-Fi isolation, or strict corporate network rules for
   testing.
 - Press `Connect` in the Android app to retry discovery.
@@ -247,8 +287,10 @@ timing with an external optical or electronic reference.
 
 ### Live preview does not show in the Hub
 
-- Confirm the Windows firewall allows inbound UDP `6101`.
-- Confirm the phone and PC are still on the same private network.
+- For Wi-Fi preview, confirm the Windows firewall allows inbound UDP `6101`.
+- For Wi-Fi preview, confirm the phone and PC are still on the same private
+  network.
+- For USB preview, confirm the phone is connected through USB/ADB reverse.
 - Reduce preview size or FPS in the Hub if the network is congested.
 
 ### Transfer is blocked
