@@ -57,6 +57,7 @@ use this Android repository when building or modifying the phone client.
 
 - Android device with camera hardware
 - Android 7.0 / API 24 or newer on the device
+- JDK 21 for command-line builds (the version used by GitHub Actions)
 - For building from source: Android SDK Platform 36.1 and Android SDK
   Build-Tools 36.1.0
 - CaptureBridge Hub running on a Windows computer
@@ -74,26 +75,48 @@ The workflow has been used mostly with `1920 x 1080` recordings at up to
 
 ## Build From Source
 
-Open the project in Android Studio, or build the signed APK from the command line:
+Open the project in Android Studio, or use the checked-in Gradle wrapper with
+JDK 21. On Windows, configure `JAVA_HOME` if Java 21 is not already the active
+JDK. Run the same unit-test, lint, and debug-build checks used by CI:
 
 ```powershell
-.\gradlew.bat assembleRelease
+.\gradlew.bat --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest --console=plain
 ```
 
-The release APK is written to:
+The debug APK is written to:
 
 ```text
-build/outputs/apk/release/
+build/outputs/apk/debug/
 ```
 
-Release builds require the repository signing configuration used by the normal
-Android Gradle workflow.
+To execute the privacy/manifest instrumentation tests, connect or start an
+Android device, confirm it appears in `adb devices`, and run:
+
+```powershell
+.\gradlew.bat --no-daemon connectedDebugAndroidTest --console=plain
+```
+
+Release signing is optional for source verification but required for a
+publishable APK. Provide `ANDROID_KEYSTORE_FILE`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and optionally
+`ANDROID_KEY_PASSWORD` as environment variables or entries in the untracked
+`local.properties` file. On Windows, the helper prompts for passwords without
+writing them to the repository:
+
+```powershell
+.\scripts\test-release-signing.ps1 -KeystoreFile C:\path\to\capturebridge-release.jks -Alias key0
+```
+
+The signed release APK is written to `build/outputs/apk/release/`. Without a
+release signing configuration, use `assembleDebug` for local installation and
+verification instead of treating an unsigned release output as distributable.
 
 ### GitHub Tag Build
 
 The GitHub Actions workflow in `.github/workflows/android-apk.yml` builds APKs
 on `v*` tags or manual runs. When a tag is available, the workflow creates or
-updates the matching GitHub Release and uploads `CaptureBridge-Android.apk`.
+updates the matching GitHub Release and uploads `CaptureBridge-Android.apk`
+plus `CaptureBridge-Android.apk.sha256`.
 
 ## Installation
 
@@ -102,6 +125,8 @@ For normal lab use, install `CaptureBridge-Android.apk` from the
 The CaptureBridge Hub portable release is distributed separately and does not
 bundle the Android APK. If you build from this Android repository, use the
 release APK produced by the normal Gradle or GitHub Actions release workflow.
+Verify a downloaded release with its adjacent SHA-256 file before installing
+it.
 
 Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.
@@ -112,10 +137,26 @@ Permissions used:
 
 - `CAMERA`
 - `INTERNET`
-- `ACCESS_NETWORK_STATE`
 
-The app does not use a cloud service. Captures are stored in the app's local
-private storage and are transferred only when the Hub sends a transfer command.
+## Security and Data Handling
+
+The app does not use a CaptureBridge-operated cloud service. Captures are
+stored under the app's private internal storage and are transferred only after
+the connected Hub requests them. Android backup is disabled so capture videos
+and metadata are not eligible for Android cloud backup or device-transfer
+backup. Captures remain on the phone until the operator deletes them from the
+Hub controls or removes the app's data.
+
+CaptureBridge control messages, live preview, and file transfers use local
+TCP/UDP sockets without application-layer authentication or TLS encryption.
+Use the system only through authorized USB/ADB connections or on a trusted,
+private, access-controlled LAN. Do not expose the Hub ports to the public
+Internet or an untrusted network.
+
+Battery telemetry reports the current percentage, Android charge status, and
+plugged source for the Hub UI. It is status telemetry, not a measurement of
+current, voltage, power, energy consumption, temperature, or battery health.
+The Hub does not persist these updates as a battery-measurement time series.
 
 ## Operator Workflow
 
@@ -342,6 +383,8 @@ https://github.com/USTP-Biomechanics/CaptureBridge-Android
 
 The repository also includes the shared [CITATION.cff](CITATION.cff), which
 GitHub uses for the `Cite this repository` button.
+
+Release-to-release changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

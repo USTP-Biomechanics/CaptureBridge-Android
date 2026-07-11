@@ -70,12 +70,16 @@ jobs:
         run: |
           mkdir -p release-assets
           cp build/outputs/apk/release/*.apk release-assets/CaptureBridge-Android.apk
+          cd release-assets
+          sha256sum CaptureBridge-Android.apk > CaptureBridge-Android.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: CaptureBridge-Android-apk
-          path: release-assets/CaptureBridge-Android.apk
+          path: |
+            release-assets/CaptureBridge-Android.apk
+            release-assets/CaptureBridge-Android.apk.sha256
 
       - name: Set release tag
         shell: bash
@@ -92,5 +96,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes "CaptureBridge Android APK."
-          gh release upload "$RELEASE_TAG" release-assets/CaptureBridge-Android.apk --clobber
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          gh release upload "$RELEASE_TAG" \
+            release-assets/CaptureBridge-Android.apk \
+            release-assets/CaptureBridge-Android.apk.sha256 \
+            --clobber
