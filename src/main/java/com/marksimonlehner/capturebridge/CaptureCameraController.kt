@@ -83,6 +83,36 @@ data class CaptureInfo(
     val files: List<CaptureFileInfo>
 )
 
+internal fun resolveDirectCaptureDirectory(root: File, name: String): File? {
+    if (name.isBlank() || name != name.trim() || name == "." || name == "..") {
+        return null
+    }
+    return try {
+        val canonicalRoot = root.canonicalFile
+        val candidate = File(canonicalRoot, name).canonicalFile
+        candidate.takeIf {
+            it.parentFile == canonicalRoot &&
+                it.name == name &&
+                !it.name.startsWith("pending_")
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+internal fun deleteFinalizedCaptureDirectories(root: File): Boolean {
+    val directories = root.listFiles { file ->
+        file.isDirectory && !file.name.startsWith("pending_")
+    } ?: return !root.exists()
+    var success = true
+    directories.forEach { directory ->
+        if (!directory.deleteRecursively()) {
+            success = false
+        }
+    }
+    return success
+}
+
 private data class ArmedCapture(
     val dir: File,
     val base: String,
@@ -601,13 +631,12 @@ class CaptureCameraController(private val context: Context) {
     }
 
     fun deleteCapture(named: String): Boolean {
-        val dir = File(capturesRoot(), named)
+        val dir = resolveDirectCaptureDirectory(capturesRoot(), named) ?: return false
         return dir.exists() && dir.deleteRecursively()
     }
 
     fun deleteAllCaptures(): Boolean {
-        val root = capturesRoot()
-        return !root.exists() || root.deleteRecursively()
+        return deleteFinalizedCaptureDirectories(capturesRoot())
     }
 
     fun transferCapture(named: String, tcp: TcpController) {
@@ -1694,8 +1723,8 @@ class CaptureCameraController(private val context: Context) {
     }
 
     private fun captureInfo(name: String): CaptureInfo? {
-        val dir = File(capturesRoot(), name)
-        if (!dir.exists() || !dir.isDirectory || dir.name.startsWith("pending_")) return null
+        val dir = resolveDirectCaptureDirectory(capturesRoot(), name) ?: return null
+        if (!dir.exists() || !dir.isDirectory) return null
         val files = dir.listFiles { file -> file.isFile }?.map {
             CaptureFileInfo(it.name, it.length(), it)
         }?.sortedBy { it.name } ?: return null

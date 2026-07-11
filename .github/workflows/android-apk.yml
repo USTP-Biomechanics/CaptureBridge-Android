@@ -39,6 +39,11 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           sdkmanager "platform-tools" "platforms;android-36.1" "build-tools;36.1.0"
 
+      - name: Verify unit tests and lint
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon testDebugUnitTest lintDebug --console=plain
+
       - name: Verify release signing secrets
         run: |
           if [[ "$HAS_RELEASE_SIGNING" != "true" ]]; then
@@ -59,7 +64,6 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          chmod +x ./gradlew
           ./gradlew --no-daemon assembleRelease
 
       - name: Prepare APK asset

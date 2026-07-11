@@ -28,6 +28,7 @@ use this Android repository when building or modifying the phone client.
 - UDP discovery of CaptureBridge Hub on the local network
 - TCP control connection to the Hub on port `6000`, either through USB/ADB
   reverse forwarding or Wi-Fi/LAN discovery
+- Battery percentage, charge status, and power-source updates for the Hub UI
 - Centralized `NAME`, `START`, and `STOP` control from CaptureBridge Hub
 - Scheduled `START_AT` and `STOP_AT` commands when Hub/phone time sync is
   available
@@ -162,7 +163,13 @@ After connecting, the Android app sends:
 ```text
 HELLO <device_name>
 TRANSPORT <usb_adb_reverse|wifi|direct> host=<host>
+BATTERY level_pct=<0..100> status=<status> plugged=<source>
 ```
+
+The app sends `BATTERY` once after every connection and again only when the
+normalized battery tuple changes. `status` is `charging`, `full`,
+`discharging`, `not_charging`, or `unknown`; `source` is `usb`, `ac`,
+`wireless`, `dock`, `none`, or `unknown`.
 
 Supported Hub commands include:
 
@@ -193,6 +200,7 @@ reverse forwarding.
 Common Android responses include:
 
 - `NAME_OK`
+- `BATTERY level_pct=<0..100> status=<status> plugged=<source>`
 - `PONG <payload> phone_elapsed_ns=<ns> phone_rx_ns=<ns> phone_tx_ns=<ns>`
 - `SYNC_OK seq=<seq> hub_tx_ns=<ns> phone_rx_ns=<ns> phone_tx_ns=<ns>`
 - `PREPARE_OK READY preroll_ms=<ms> camera_lead_ms=<ms>`
@@ -306,12 +314,14 @@ compatibility. The root Gradle project is the Android application.
 
 ```text
 src/main/java/com/marksimonlehner/capturebridge/
-  MainActivity.kt              Android UI and Hub command handling
+  MainActivity.kt              Android activity and Compose UI
+  BatteryTelemetry.kt          Change-driven battery status reporting
+  CaptureCommandHandler.kt     Hub command routing and protocol parsing
   TcpController.kt             UDP discovery, TCP connection, and file transfer
   CaptureCameraController.kt   Camera2 sessions, capture storage, metadata
   RollingVideoEncoder.kt       MediaCodec rolling buffer and MP4 segment muxing
   TimestampedCameraInput.kt    Timestamped camera frames for encoder input
-  PhoneLivePreviewStreamer.kt  UDP JPEG live preview stream
+  PhoneLivePreviewStreamer.kt  UDP/TCP JPEG live preview stream
 src/main/AndroidManifest.xml
 proguard-rules.pro
 gradle/libs.versions.toml

@@ -183,8 +183,8 @@ class RollingVideoEncoder(
     private val segmentSamples = mutableListOf<SpoolSample>()
     private val sensorTimestampQueueUs = ArrayDeque<Long>()
     private val pendingEncodedSamples = ArrayDeque<PendingEncodedSample>()
-    private val sensorTimestampEvents = mutableListOf<SensorTimestampEvent>()
-    private val encodedTimestampEvents = mutableListOf<EncodedTimestampEvent>()
+    private val sensorTimestampEvents = ArrayDeque<SensorTimestampEvent>()
+    private val encodedTimestampEvents = ArrayDeque<EncodedTimestampEvent>()
     private val bufferInfo = MediaCodec.BufferInfo()
     private val retentionUs = max(1_000_000L, prerollMs * 1000L + 1_000_000L)
     private val sensorTimestampQueueLimit = max(120, fps.coerceAtLeast(1) * 2)
@@ -195,6 +195,7 @@ class RollingVideoEncoder(
     private var codec: MediaCodec? = null
     private var surface: Surface? = null
     private var drainThread: Thread? = null
+    @Volatile
     private var draining = false
     private var outputFormat: MediaFormat? = null
     private var latestPresentationUs = 0L
@@ -356,7 +357,7 @@ class RollingVideoEncoder(
                     )
                 )
                 while (sensorTimestampEvents.size > TIMESTAMP_DIAGNOSTIC_EVENT_LIMIT) {
-                    sensorTimestampEvents.removeAt(0)
+                    sensorTimestampEvents.removeFirst()
                 }
             }
             if (useSensorTimestampMapping) {
@@ -697,7 +698,7 @@ class RollingVideoEncoder(
                     )
                 )
                 while (encodedTimestampEvents.size > TIMESTAMP_DIAGNOSTIC_EVENT_LIMIT) {
-                    encodedTimestampEvents.removeAt(0)
+                    encodedTimestampEvents.removeFirst()
                 }
             }
             if (useSensorTimestampMapping) {

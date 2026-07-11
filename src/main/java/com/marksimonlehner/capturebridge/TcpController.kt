@@ -37,6 +37,13 @@ enum class ConnectionTransport(val protocolValue: String) {
     DirectHost("direct")
 }
 
+internal fun reconnectDelaySeconds(attempt: Int): Long = when (attempt.coerceAtLeast(0)) {
+    0 -> 1L
+    1 -> 2L
+    2 -> 4L
+    else -> 8L
+}
+
 class TcpController(private val context: Context) {
     data class TransferFile(
         val file: File,
@@ -49,12 +56,14 @@ class TcpController(private val context: Context) {
 
     var onCommand: ((String) -> Unit)? = null
     var onDiscoveryStatus: ((String) -> Unit)? = null
+    var onConnected: (() -> Unit)? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val connectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val generation = AtomicInteger(0)
+    private val reconnectAttempt = AtomicInteger(0)
     private val sendLock = Object()
 
     @Volatile
@@ -72,6 +81,9 @@ class TcpController(private val context: Context) {
         quietRetry: Boolean = false,
         transport: ConnectionTransport = ConnectionTransport.DirectHost
     ) {
+        if (!quietRetry) {
+            resetReconnectBackoff()
+        }
         this.preferDiscovery = preferDiscovery
         lastHost = host
         lastPort = port
@@ -92,6 +104,8 @@ class TcpController(private val context: Context) {
                     return@execute
                 }
                 socket = nextSocket
+                resetReconnectBackoff()
+                sendHello(transport, host)
                 updateState(ConnectionState.Connected)
                 postDiscoveryStatus(
                     when (transport) {
@@ -100,7 +114,7 @@ class TcpController(private val context: Context) {
                         ConnectionTransport.DirectHost -> "Connected"
                     }
                 )
-                sendHello(transport, host)
+                postConnected()
                 receiveLoop(nextSocket, connectGeneration)
             } catch (error: Exception) {
                 if (connectGeneration == generation.get()) {
@@ -117,6 +131,9 @@ class TcpController(private val context: Context) {
     }
 
     fun discoverAndConnect(port: Int, quietRetry: Boolean = false, onResolved: ((String) -> Unit)? = null) {
+        if (!quietRetry) {
+            resetReconnectBackoff()
+        }
         preferDiscovery = true
         lastHost = null
         lastPort = port
@@ -304,6 +321,7 @@ class TcpController(private val context: Context) {
     private fun scheduleReconnectIfNeeded() {
         val port = lastPort ?: return
         reconnectFuture?.cancel(false)
+        val delaySeconds = reconnectDelaySeconds(reconnectAttempt.getAndIncrement())
         reconnectFuture = scheduler.schedule({
             if (preferDiscovery) {
                 discoverAndConnect(port, quietRetry = true, onResolved = discoveryOnResolved)
@@ -313,7 +331,7 @@ class TcpController(private val context: Context) {
                     connect(host, port, quietRetry = true)
                 }
             }
-        }, 1, TimeUnit.SECONDS)
+        }, delaySeconds, TimeUnit.SECONDS)
     }
 
     private fun tryUsbReverseConnection(port: Int, quietRetry: Boolean, connectGeneration: Int): Boolean {
@@ -331,9 +349,11 @@ class TcpController(private val context: Context) {
             }
             socket = nextSocket
             mainHandler.post { discoveryOnResolved?.invoke(host) }
+            resetReconnectBackoff()
+            sendHello(ConnectionTransport.UsbAdbReverse, host)
             updateState(ConnectionState.Connected)
             postDiscoveryStatus("Connected via USB")
-            sendHello(ConnectionTransport.UsbAdbReverse, host)
+            postConnected()
             receiveLoop(nextSocket, generation.get())
             return true
         } catch (_: Exception) {
@@ -368,6 +388,14 @@ class TcpController(private val context: Context) {
 
     private fun postDiscoveryStatus(message: String) {
         mainHandler.post { onDiscoveryStatus?.invoke(message) }
+    }
+
+    private fun postConnected() {
+        mainHandler.post { onConnected?.invoke() }
+    }
+
+    private fun resetReconnectBackoff() {
+        reconnectAttempt.set(0)
     }
 
     private fun deviceDisplayName(): String {
