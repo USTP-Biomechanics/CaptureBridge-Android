@@ -16,7 +16,7 @@ inverse-kinematics pipelines.
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
-[CaptureBridge Hub v1.0.9](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.9),
+[CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10),
 the Windows desktop controller and transfer host. For normal lab installs, the
 Hub release ZIP is downloaded separately from the Android phone client. Install
 `CaptureBridge-Android.apk` from the
@@ -27,7 +27,7 @@ use this Android repository when building or modifying the phone client.
 
 The release pair archived for the CaptureBridge SoftwareX submission is:
 
-- [CaptureBridge Hub v1.0.9](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.9)
+- [CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10)
 - [CaptureBridge Android v1.0.15](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15)
 
 Use these two versions together when reproducing the published software
