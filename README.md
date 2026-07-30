@@ -16,12 +16,23 @@ inverse-kinematics pipelines.
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
-[USTP-Biomechanics/CaptureBridge-Hub](https://github.com/USTP-Biomechanics/CaptureBridge-Hub),
+[CaptureBridge Hub v1.0.9](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.9),
 the Windows desktop controller and transfer host. For normal lab installs, the
 Hub release ZIP is downloaded separately from the Android phone client. Install
 `CaptureBridge-Android.apk` from the
-[latest CaptureBridge Android release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/latest);
+[CaptureBridge Android v1.0.15 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15);
 use this Android repository when building or modifying the phone client.
+
+## Compatible Release Pair
+
+The release pair archived for the CaptureBridge SoftwareX submission is:
+
+- [CaptureBridge Hub v1.0.9](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.9)
+- [CaptureBridge Android v1.0.15](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15)
+
+Use these two versions together when reproducing the published software
+configuration. Future releases may change the protocol or installation
+instructions.
 
 ## Main Features
 
@@ -121,12 +132,20 @@ plus `CaptureBridge-Android.apk.sha256`.
 ## Installation
 
 For normal lab use, install `CaptureBridge-Android.apk` from the
-[latest CaptureBridge Android release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/latest).
+[CaptureBridge Android v1.0.15 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15).
 The CaptureBridge Hub portable release is distributed separately and does not
 bundle the Android APK. If you build from this Android repository, use the
 release APK produced by the normal Gradle or GitHub Actions release workflow.
-Verify a downloaded release with its adjacent SHA-256 file before installing
-it.
+Before installing, download the adjacent `CaptureBridge-Android.apk.sha256`
+file and compare its first field with one of these commands:
+
+```powershell
+(Get-FileHash -Algorithm SHA256 .\CaptureBridge-Android.apk).Hash.ToLowerInvariant()
+```
+
+```bash
+sha256sum CaptureBridge-Android.apk
+```
 
 Install the chosen APK on each Android phone that should participate in a
 CaptureBridge session. On first launch, Android will request camera permission.
@@ -208,7 +227,7 @@ BATTERY level_pct=<0..100> status=<status> plugged=<source>
 ```
 
 The app sends `BATTERY` once after every connection and again only when the
-normalized battery tuple changes. `status` is `charging`, `full`,
+normalized battery values change. `status` is `charging`, `full`,
 `discharging`, `not_charging`, or `unknown`; `source` is `usb`, `ac`,
 `wireless`, `dock`, `none`, or `unknown`.
 
@@ -372,19 +391,28 @@ settings.gradle.kts
 
 ## Citation
 
-If you use CaptureBridge in academic work, please cite the shared software
-citation:
+If you use CaptureBridge Android in academic work, cite this repository and the
+companion Hub:
 
 ```text
-Simonlehner, M. (2026). CaptureBridge: Hub and Android client [Computer software suite].
-https://github.com/USTP-Biomechanics/CaptureBridge-Hub
+Simonlehner, M. (2026). CaptureBridge Android: Smartphone recording client
+[Computer software]. Version 1.0.15.
 https://github.com/USTP-Biomechanics/CaptureBridge-Android
+https://github.com/USTP-Biomechanics/CaptureBridge-Hub
 ```
 
-The repository also includes the shared [CITATION.cff](CITATION.cff), which
-GitHub uses for the `Cite this repository` button.
+The repository also includes [CITATION.cff](CITATION.cff), which GitHub uses
+for the `Cite this repository` button.
 
 Release-to-release changes are summarized in [CHANGELOG.md](CHANGELOG.md).
+
+## Support
+
+For questions, contact mark.simonlehner@ustp.at. Reproducible software defects
+can also be reported through the
+[Android issue tracker](https://github.com/USTP-Biomechanics/CaptureBridge-Android/issues).
+Do not attach identifiable participant videos or other sensitive data to a
+public issue.
 
 ## License
 
