@@ -3,7 +3,7 @@
 Notable changes to CaptureBridge Android are recorded here. GitHub releases
 remain the authoritative source for published APKs and their checksums.
 
-## 1.0.16 - Unreleased
+## 1.0.16 - 2026-10-13
 
 - High-speed modes (above 60 fps), where Android forces auto exposure and fixes
   the exposure time near the frame period, now match the brightness of the

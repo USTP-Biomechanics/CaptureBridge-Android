@@ -16,23 +16,25 @@ inverse-kinematics pipelines.
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
-[CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10),
+[CaptureBridge Hub v1.0.11](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.11),
 the Windows desktop controller and transfer host. For normal lab installs, the
 Hub release ZIP is downloaded separately from the Android phone client. Install
 `CaptureBridge-Android.apk` from the
-[CaptureBridge Android v1.0.15 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15);
+[CaptureBridge Android v1.0.16 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.16);
 use this Android repository when building or modifying the phone client.
 
 ## Compatible Release Pair
 
-The release pair archived for the CaptureBridge SoftwareX submission is:
+Use these two versions together:
 
-- [CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10)
-- [CaptureBridge Android v1.0.15](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15)
+- [CaptureBridge Hub v1.0.11](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.11)
+- [CaptureBridge Android v1.0.16](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.16)
 
-Use these two versions together when reproducing the published software
-configuration. Future releases may change the protocol or installation
-instructions.
+The release pair archived for the CaptureBridge SoftwareX submission is
+[CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10) with
+[CaptureBridge Android v1.0.15](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15); use that pair when
+reproducing the submitted software configuration. Future releases may change
+the protocol or installation instructions.
 
 ## Main Features
 
@@ -158,7 +160,7 @@ plus `CaptureBridge-Android.apk.sha256`.
 ## Installation
 
 For normal lab use, install `CaptureBridge-Android.apk` from the
-[CaptureBridge Android v1.0.15 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15).
+[CaptureBridge Android v1.0.16 release](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.16).
 The CaptureBridge Hub portable release is distributed separately and does not
 bundle the Android APK. If you build from this Android repository, use the
 release APK produced by the normal Gradle or GitHub Actions release workflow.
@@ -495,7 +497,7 @@ companion Hub:
 
 ```text
 Simonlehner, M. (2026). CaptureBridge Android: Smartphone recording client
-[Computer software]. Version 1.0.15.
+[Computer software]. Version 1.0.16.
 https://github.com/USTP-Biomechanics/CaptureBridge-Android
 https://github.com/USTP-Biomechanics/CaptureBridge-Hub
 ```
