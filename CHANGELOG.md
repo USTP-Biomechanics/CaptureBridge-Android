@@ -3,6 +3,18 @@
 Notable changes to CaptureBridge Android are recorded here. GitHub releases
 remain the authoritative source for published APKs and their checksums.
 
+## 1.0.17 - 2026-10-13
+
+- Fixed automatic high-speed exposure compensation, which never adjusted in
+  1.0.16: in a constrained high-speed session the capture callbacks report the
+  framework's inner capture session rather than the high-speed session the app
+  keeps, so every result was ignored. Results are now matched to the current
+  session by request tag.
+- The automatic exposure compensation now changes only after auto exposure has
+  settled: three consecutive checks must agree within 0.2 EV, and a new session
+  waits 1.5 s before the first check. This stops it from hunting while auto
+  exposure is still moving or the scene changes.
+
 ## 1.0.16 - 2026-10-13
 
 - High-speed modes (above 60 fps), where Android forces auto exposure and fixes

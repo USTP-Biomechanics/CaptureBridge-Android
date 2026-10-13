@@ -44,6 +44,34 @@ class CameraExposureCompensationTest {
     }
 
     @Test
+    fun isCurrentHighSpeedAeResult_matchesSessionByRequestTag() {
+        // Current session generation and compensation index; the result may or may not report its index.
+        assertTrue(isCurrentHighSpeedAeResult(7, 7, -13, -13, -13))
+        assertTrue(isCurrentHighSpeedAeResult(7, 7, -13, null, -13))
+        // A late result from an earlier session, or a request without a tag.
+        assertFalse(isCurrentHighSpeedAeResult(6, 7, -13, -13, -13))
+        assertFalse(isCurrentHighSpeedAeResult(null, 7, -13, -13, -13))
+        // A request still sent with the previous compensation index.
+        assertFalse(isCurrentHighSpeedAeResult(7, 7, 0, null, -13))
+        // The camera reports a different compensation than the request.
+        assertFalse(isCurrentHighSpeedAeResult(7, 7, -13, 0, -13))
+    }
+
+    @Test
+    fun stableHighSpeedAeEv_waitsForAgreeingSamples() {
+        // Too few samples yet.
+        assertNull(stableHighSpeedAeEv(listOf(-0.3, -0.31), 3, 0.2))
+        // Auto exposure still moving: the last three disagree by more than 0.2 EV.
+        assertNull(stableHighSpeedAeEv(listOf(-0.26, -0.62, -0.15), 3, 0.2))
+        // Settled: the median of the last three is used, older samples are ignored.
+        assertEquals(-0.3, stableHighSpeedAeEv(listOf(-1.7, -0.32, -0.3, -0.28), 3, 0.2)!!, 1e-9)
+        assertEquals(-0.3, stableHighSpeedAeEv(listOf(-0.3, -0.3, -0.3), 3, 0.2)!!, 1e-9)
+        // Unusable inputs.
+        assertNull(stableHighSpeedAeEv(listOf(-0.3, Double.NaN, -0.3), 3, 0.2))
+        assertNull(stableHighSpeedAeEv(listOf(-0.3, -0.3, -0.3), 0, 0.2))
+    }
+
+    @Test
     fun aeCompensationIndexForEv_roundsAndClampsTenthEvSteps() {
         assertEquals(-20, aeCompensationIndexForEv(-2.0, 1, 10, -20, 20))
         assertEquals(-20, aeCompensationIndexForEv(-3.0, 1, 10, -20, 20))

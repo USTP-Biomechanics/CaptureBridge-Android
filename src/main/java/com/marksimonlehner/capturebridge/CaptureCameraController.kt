@@ -154,6 +154,43 @@ internal fun autoHighSpeedAeCompensationEv(
     return log2(targetIso * targetShutterSeconds / autoExposureProduct)
 }
 
+/**
+ * Whether a preview result may drive automatic high-speed exposure.
+ *
+ * A constrained high-speed session reports its captures through the framework's inner capture
+ * session, not the CameraConstrainedHighSpeedCaptureSession that onConfigured received, so results
+ * are matched to the current session by request tag (the session generation) instead of by session.
+ * The request must also carry the current compensation index; a result that reports its own
+ * compensation must agree with it.
+ */
+internal fun isCurrentHighSpeedAeResult(
+    requestTag: Any?,
+    currentGeneration: Int,
+    requestIndex: Int?,
+    resultIndex: Int?,
+    currentIndex: Int
+): Boolean = requestTag == currentGeneration && requestIndex == currentIndex &&
+    (resultIndex == null || resultIndex == currentIndex)
+
+/**
+ * The EV to apply once auto exposure has settled, or null while it is still moving.
+ *
+ * Auto exposure takes several frames to follow a compensation or scene change, and some cameras
+ * report no AE state in high-speed results, so the last [samples] ideal EVs must agree within
+ * [toleranceEv]; their median is returned.
+ */
+internal fun stableHighSpeedAeEv(recentIdealEvs: List<Double>, samples: Int, toleranceEv: Double): Double? {
+    if (samples <= 0 || recentIdealEvs.size < samples) {
+        return null
+    }
+    val window = recentIdealEvs.takeLast(samples)
+    if (window.any { !it.isFinite() } || window.maxOrNull()!! - window.minOrNull()!! > toleranceEv) {
+        return null
+    }
+    val sorted = window.sorted()
+    return if (sorted.size % 2 == 1) sorted[sorted.size / 2] else (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+}
+
 internal fun aeCompensationIndexForEv(
     ev: Double,
     stepNumerator: Int,
@@ -266,6 +303,8 @@ class CaptureCameraController(private val context: Context) {
     private var highSpeedRequestBuilder: CaptureRequest.Builder? = null
     private var lastAutoAeCheckElapsedMs = 0L
     private var lastAutoAeChangeElapsedMs = 0L
+    private val recentIdealAeEvs = ArrayDeque<Double>()
+    private var autoAeSettleUntilElapsedMs = 0L
 
     @Volatile
     private var highSpeedSessionActive = false
@@ -338,7 +377,7 @@ class CaptureCameraController(private val context: Context) {
                     appendIntrinsics(result, captureResultIndex)
                 }
             } else if (highSpeedSessionActive) {
-                adjustAutoHighSpeedExposure(session, result)
+                adjustAutoHighSpeedExposure(request, result)
             }
         }
 
@@ -1043,6 +1082,10 @@ class CaptureCameraController(private val context: Context) {
                                 armed?.let { addTarget(it.encoderSurface) }
                                 applyCameraRequestSettings(this, useHighSpeedSession = useHighSpeedSession)
                             }
+                            if (useHighSpeedSession) {
+                                // Lets automatic exposure tell this session's results from late ones.
+                                requestBuilder.setTag(generation)
+                            }
                             val request = requestBuilder.build()
                             if (useHighSpeedSession) {
                                 val highSpeedSession = session as? CameraConstrainedHighSpeedCaptureSession
@@ -1054,6 +1097,9 @@ class CaptureCameraController(private val context: Context) {
                                 )
                                 highSpeedRequestBuilder = requestBuilder
                                 lastAutoAeChangeElapsedMs = SystemClock.elapsedRealtime()
+                                // A new session's auto exposure starts from scratch and needs longer.
+                                autoAeSettleUntilElapsedMs = lastAutoAeChangeElapsedMs + AUTO_AE_START_SETTLE_MS
+                                recentIdealAeEvs.clear()
                                 highSpeedSessionActive = true
                             } else {
                                 session.setRepeatingRequest(request, captureCallback, backgroundHandler)
@@ -2223,23 +2269,30 @@ class CaptureCameraController(private val context: Context) {
      * AUTO_AE_CHECK_INTERVAL_MS, and judges only frames that already carry the current compensation
      * with a settled auto exposure, so exposure never changes inside a capture and does not hunt.
      */
-    private fun adjustAutoHighSpeedExposure(session: CameraCaptureSession, result: TotalCaptureResult) {
-        if (fixedHighSpeedAeCompensationEv != null || session !== captureSession) {
+    private fun adjustAutoHighSpeedExposure(request: CaptureRequest, result: TotalCaptureResult) {
+        if (fixedHighSpeedAeCompensationEv != null) {
             return
         }
         val nowMs = SystemClock.elapsedRealtime()
         val sinceChangeMs = nowMs - lastAutoAeChangeElapsedMs
-        if (nowMs - lastAutoAeCheckElapsedMs < AUTO_AE_CHECK_INTERVAL_MS || sinceChangeMs < AUTO_AE_SETTLE_MS) {
+        if (nowMs - lastAutoAeCheckElapsedMs < AUTO_AE_CHECK_INTERVAL_MS || nowMs < autoAeSettleUntilElapsedMs) {
+            return
+        }
+        val currentIndex = appliedHighSpeedAeCompensationIndex ?: return
+        if (!isCurrentHighSpeedAeResult(
+                requestTag = request.tag,
+                currentGeneration = sessionGeneration.get(),
+                requestIndex = request.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION),
+                resultIndex = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION),
+                currentIndex = currentIndex
+            )
+        ) {
             return
         }
         lastAutoAeCheckElapsedMs = nowMs
-        val highSpeedSession = session as? CameraConstrainedHighSpeedCaptureSession ?: return
+        val highSpeedSession = captureSession as? CameraConstrainedHighSpeedCaptureSession ?: return
         val builder = highSpeedRequestBuilder ?: return
         val aeCompensation = cameraId?.let { aeCompensationCapability(it) } ?: return
-        val currentIndex = appliedHighSpeedAeCompensationIndex ?: return
-        if (result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION) != currentIndex) {
-            return
-        }
         val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
         val aeSettled = aeState == null ||
             aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
@@ -2257,7 +2310,13 @@ class CaptureCameraController(private val context: Context) {
             measuredExposureSeconds = measuredExposureNs / 1_000_000_000.0,
             appliedEv = aeCompensation.evForIndex(currentIndex)
         ) ?: return
-        val targetIndex = aeCompensation.indexForEv(idealEv)
+        recentIdealAeEvs.addLast(idealEv)
+        while (recentIdealAeEvs.size > AUTO_AE_STABLE_SAMPLES) {
+            recentIdealAeEvs.removeFirst()
+        }
+        val stableEv = stableHighSpeedAeEv(recentIdealAeEvs.toList(), AUTO_AE_STABLE_SAMPLES, AUTO_AE_STABLE_TOLERANCE_EV)
+            ?: return
+        val targetIndex = aeCompensation.indexForEv(stableEv)
         if (abs(aeCompensation.evForIndex(targetIndex) - aeCompensation.evForIndex(currentIndex)) < AUTO_AE_DEADBAND_EV) {
             return
         }
@@ -2276,10 +2335,12 @@ class CaptureCameraController(private val context: Context) {
         appliedHighSpeedAeCompensationIndex = targetIndex
         autoAeCompensationIndexByMode[highSpeedModeKey()] = targetIndex
         lastAutoAeChangeElapsedMs = nowMs
+        autoAeSettleUntilElapsedMs = nowMs + AUTO_AE_SETTLE_MS
+        recentIdealAeEvs.clear()
         Log.i(
             CAMERA_LOG_TAG,
             "Automatic high-speed EV ${aeCompensation.evForIndex(currentIndex)} -> " +
-                "${aeCompensation.evForIndex(targetIndex)} EV (ideal ${String.format(Locale.US, "%.2f", idealEv)}): " +
+                "${aeCompensation.evForIndex(targetIndex)} EV (ideal ${String.format(Locale.US, "%.2f", stableEv)}): " +
                 "measured ISO $measuredIso at ${measuredExposureNs / 1_000_000.0} ms, " +
                 "requested ISO $targetIso at ${targetShutterSeconds * 1000.0} ms"
         )
@@ -2514,8 +2575,11 @@ class CaptureCameraController(private val context: Context) {
         private const val HIGH_SPEED_INTRINSICS_SAMPLE_INTERVAL = 30
         private const val AUTO_AE_CHECK_INTERVAL_MS = 250L
         private const val AUTO_AE_SETTLE_MS = 700L
+        private const val AUTO_AE_START_SETTLE_MS = 1500L
         private const val AUTO_AE_MAX_SETTLE_WAIT_MS = 3000L
         private const val AUTO_AE_DEADBAND_EV = 0.25
+        private const val AUTO_AE_STABLE_SAMPLES = 3
+        private const val AUTO_AE_STABLE_TOLERANCE_EV = 0.2
         private const val PREVIEW_BITMAP_TIMEOUT_MS = 500L
     }
 }

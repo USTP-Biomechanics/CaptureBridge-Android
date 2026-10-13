@@ -5,11 +5,11 @@ authors:
   - family-names: "Simonlehner"
     given-names: "Mark"
 year: 2026
-version: "1.0.16"
+version: "1.0.17"
 date-released: 2026-10-13
 license: MIT
 repository-code: "https://github.com/USTP-Biomechanics/CaptureBridge-Android"
-url: "https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.16"
+url: "https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.17"
 abstract: "Open-source Android recording client for coordinated smartphone video acquisition with CaptureBridge Hub, including Camera2 capability reporting, pre-armed MediaCodec recording, scheduled phone-clock boundaries, live preview, battery telemetry, private capture storage, and structured metadata transfer."
 keywords:
   - biomechanics
