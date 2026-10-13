@@ -123,6 +123,9 @@ private data class CapturedPreviewFrame(
 
 class PhoneLivePreviewStreamer(
     private val imageReaderProvider: () -> ImageReader?,
+    // Used when the session has no ImageReader output (constrained high-speed sessions): a snapshot of
+    // the on-screen preview, already upright, scaled so its longest side fits the given size.
+    private val previewBitmapProvider: (maxDimension: Int) -> Bitmap?,
     private val rotationQuarterTurnsProvider: () -> Int,
     private val stateCallback: (LivePreviewState) -> Unit,
 ) {
@@ -287,12 +290,31 @@ class PhoneLivePreviewStreamer(
     }
 
     private fun capturePreviewFrame(request: LivePreviewStartRequest): CapturedPreviewFrame? {
-        val imageReader = imageReaderProvider() ?: return null
+        val imageReader = imageReaderProvider() ?: return capturePreviewBitmapFrame(request)
         val image = imageReader.acquireLatestImage() ?: return null
         try {
             return captureImageFrame(image, request)
         } finally {
             image.close()
+        }
+    }
+
+    private fun capturePreviewBitmapFrame(request: LivePreviewStartRequest): CapturedPreviewFrame? {
+        val bitmap = previewBitmapProvider(request.maxDimension) ?: return null
+        try {
+            val output = ByteArrayOutputStream()
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, request.jpegQuality, output)) {
+                return null
+            }
+            return CapturedPreviewFrame(
+                jpegBytes = output.toByteArray(),
+                width = bitmap.width,
+                height = bitmap.height,
+                timestampMs = System.currentTimeMillis(),
+                rotationQuarterTurns = 0,
+            )
+        } finally {
+            bitmap.recycle()
         }
     }
 

@@ -3,6 +3,35 @@
 Notable changes to CaptureBridge Android are recorded here. GitHub releases
 remain the authoritative source for published APKs and their checksums.
 
+## 1.0.16 - Unreleased
+
+- High-speed modes (above 60 fps), where Android forces auto exposure and fixes
+  the exposure time near the frame period, now match the brightness of the
+  requested ISO and shutter automatically: between recordings the phone sets
+  the exposure compensation from the exposure time and ISO auto exposure
+  chooses, within the camera's range, and remembers it per camera mode. A
+  `highSpeedAeCompensationEv` in `SETTINGS` fixes the EV instead. `SETTINGS_OK`
+  and `SETTINGS_LIST_OK` report `highSpeedAeCompensationMode`, the applied EV
+  and the camera's `aeCompensation` range; each capture's `.state.json` records
+  them with `exposure_control`. Non-finite ISO, shutter, or EV values are
+  rejected with `SETTINGS_ERR INVALID_VALUES`.
+- Phone live preview in high-speed modes now keeps the high-speed session and
+  streams snapshots of its preview, so the Hub shows the real high-speed
+  exposure and recording works while streaming.
+- Changed the on-screen camera summary for high-speed modes to say the shutter
+  is fixed and show the EV in use instead of ISO and shutter values that do not
+  apply there.
+- Added the app version under the "TCP camera recorder" subtitle.
+- Improved USB-only operation without Wi-Fi: the phone probes the USB/ADB
+  reverse tunnel every second, shows `No Wi-Fi - waiting for Hub over USB`
+  instead of a Wi-Fi error, and handles a leftover tunnel with no Hub behind it
+  (`USB tunnel open, Hub not answering - retrying`).
+- Hardened Wi-Fi discovery: probes are sent to each target separately, subnet
+  broadcast addresses go first, stray datagrams are ignored, and overlapping
+  retries no longer race.
+- Connection changes no longer rebuild the camera session (and discard the
+  armed pre-roll) when phone live preview is not running.
+
 ## 1.0.15 - 2026-07-11
 
 - Disabled Android cloud backup and device-transfer backup for locally stored

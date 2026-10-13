@@ -45,7 +45,8 @@ instructions.
   available
 - Android Camera2 camera capability reporting
 - Remote camera setting requests for resolution, frame rate, ISO, and shutter
-  time where supported by the phone
+  time where supported by the phone; above 60 fps the shutter is fixed and the
+  phone matches the requested brightness automatically
 - Raw live preview streaming to the Hub over UDP `6101` or TCP through USB/ADB
   reverse forwarding
 - Pre-armed H.264 MP4 recording through Android `MediaCodec`
@@ -79,10 +80,35 @@ instructions.
   `6101` by default; for USB preview, the Hub requests TCP preview through ADB
   reverse forwarding
 
+## High Frame Rates and Exposure
+
 High frame rates depend on the phone. The app reports available modes through
 Camera2, and the Hub should choose a mode supported by all connected phones.
 The workflow has been used mostly with `1920 x 1080` recordings at up to
 `240 fps` on supported devices.
+
+Modes above `60 fps` that the phone reports as high-speed (`highSpeed: true`,
+for example `1920 x 1080` at `240 fps`) run in an Android constrained
+high-speed camera session. Android forces auto exposure in these sessions and
+the exposure time stays close to the frame period (about `4.0 ms` at
+`240 fps`), so **the shutter is fixed above 60 fps**: a shorter shutter setting
+cannot reduce motion blur there, and the camera picks the ISO itself.
+
+The phone still uses the Hub's ISO and shutter as a brightness target. Between
+recordings it reads the exposure time and ISO that auto exposure chose and sets
+the exposure compensation so that exposure time x ISO matches the requested
+shutter x ISO, rounded to the camera's compensation step and clamped to its
+range (usually `-2.0` to `+2.0` EV). A short requested shutter therefore lowers
+the sensor gain and noise. The phone never changes exposure during a recording,
+waits for auto exposure to settle between adjustments, and remembers the value
+per camera mode, so a rebuilt session starts where the last one converged. The
+camera line on the phone screen, the `SETTINGS_OK` reply, and each capture's
+`.state.json` report the value in use. A tool can still fix the EV with
+`highSpeedAeCompensationEv` in `SETTINGS`.
+
+Phone live preview keeps the high-speed session running in these modes and
+streams snapshots of its on-screen preview at the stream FPS, so the Hub shows
+the real high-speed exposure and recording keeps working while streaming.
 
 ## Build From Source
 
@@ -200,13 +226,18 @@ The Hub does not persist these updates as a battery-measurement time series.
 11. Transfer the current capture or all captures from the Hub.
 12. Use the Hub's stream checkboxes when live phone preview is needed.
 
-The Android screen shows connection state, recording state, the active capture
-label, camera settings, and transfer state.
+The Android screen shows the app version (for example `v1.0.16`) under the
+"TCP camera recorder" subtitle, plus connection state, recording state, the
+active capture label, camera settings, and transfer state. In high-speed modes
+the camera line reads `<width>x<height> @ <fps> fps | shutter fixed | <EV> auto`,
+for example `1920x1080 @ 240 fps | shutter fixed | -2.0 EV auto`, instead of
+ISO and shutter values that the camera cannot apply there.
 
 ## Network Protocol Summary
 
-The app first tries USB/ADB reverse connection to local TCP `6000`. If that is
-not available, it searches for CaptureBridge Hub by broadcasting:
+The app first tries the USB/ADB reverse tunnel at local TCP `127.0.0.1:6000`,
+which the Hub creates with `adb reverse tcp:6000 tcp:6000`. If that is not
+available, it searches for CaptureBridge Hub by broadcasting:
 
 ```text
 DISCOVER_UDPCAMERA
@@ -217,6 +248,12 @@ The Hub replies with:
 ```text
 UDPCAMERA_OK 6000
 ```
+
+The probe goes to each network's subnet broadcast address first and then to
+`255.255.255.255`; other datagrams are ignored while the phone waits for the
+reply. Until a Hub answers, the phone probes the USB tunnel every second (less
+often while a leftover tunnel has no Hub behind it) and repeats Wi-Fi discovery
+with a 1, 2, 4, then 8 second backoff.
 
 After connecting, the Android app sends:
 
@@ -256,6 +293,24 @@ Supported Hub commands include:
 `jpegQuality`, `maxDimension`, and optionally `streamKey`. The preview protocol
 is `udp` for Wi-Fi/LAN and `tcp` when the Hub routes preview through USB/ADB
 reverse forwarding.
+
+`SETTINGS <json>` carries the complete requested camera state. `width`,
+`height`, `iso`, and `shutterSeconds` are required, and `fps` picks the frame
+rate for that resolution. In high-speed modes the phone matches the brightness
+of `iso` x `shutterSeconds` automatically. An optional
+`highSpeedAeCompensationEv` fixes the exposure compensation in EV instead (for
+tooling and tests; the Hub does not send it). A non-numeric or non-finite
+value, or a magnitude above `10` EV, returns `SETTINGS_ERR INVALID_VALUES`.
+
+`SETTINGS_OK` and `SETTINGS_LIST_OK` return the camera `position`, the
+reported `resolutions` (`width`, `height`, `fps`, `highSpeed`), and a `current`
+object with `width`, `height`, `fps`, `highSpeed`, `iso`, `shutterSeconds`,
+`highSpeedAeCompensationMode` (`auto` or `fixed`), `highSpeedAeCompensationEv`
+(only when a fixed EV was set), and `highSpeedAeCompensationAppliedEv` (the EV
+the high-speed session uses, or `null` outside high-speed modes or when the
+camera has no exposure compensation). The top-level `aeCompensation` object reports `minEv`,
+`maxEv`, and `stepEv` for the current camera, or is `null` when the camera has
+no exposure compensation.
 
 Common Android responses include:
 
@@ -314,6 +369,27 @@ frame offsets, keyframe selection, phone receive duration, and related trim
 diagnostics. Camera-time diagnostics are written when the active backend has
 camera/encoder timestamp information to report.
 
+The state JSON also records how exposure was controlled:
+
+- `exposure_control`: `auto_high_speed` for a constrained high-speed session,
+  otherwise `manual` when the camera supports manual sensor control (the Hub's
+  ISO and shutter apply) or `auto`
+- `high_speed_ae_compensation_mode`: `auto` (brightness matched to the
+  requested ISO and shutter) or `fixed`
+- `high_speed_ae_compensation_ev_requested`: the fixed EV, or `null` in `auto`
+- `high_speed_ae_compensation_index` and
+  `high_speed_ae_compensation_ev_applied`: the compensation index and EV set on
+  the camera, or `null` when the session was not high-speed or the camera has
+  no exposure compensation
+- `ae_compensation_step_ev`, `ae_compensation_min_ev`, and
+  `ae_compensation_max_ev`: the camera's compensation step and range, or `null`
+  when it has none
+
+In high-speed captures, `target_iso` and `target_shutter_seconds` are the Hub's
+request, not the values the camera used; the intrinsics CSV records the
+exposure time and ISO the camera reported, sampled on the first and every
+30th frame.
+
 The current recording backend pre-arms a `MediaCodec` H.264 encoder before the
 Hub starts a capture. Encoded samples are retained in a rolling in-memory buffer
 and the final MP4 is muxed only after `STOP`, using the requested start and end
@@ -347,10 +423,33 @@ should validate timing with an external optical or electronic reference.
   testing.
 - Press `Connect` in the Android app to retry discovery.
 
+### USB without Wi-Fi
+
+A phone connected only by USB does not need Wi-Fi when the Hub can run `adb`
+and has set up the `adb reverse` tunnel for it; the Hub log then shows
+`ADB reverse ready` for the phone and the Hub's ADB status counts it under
+`USB reverse`. The phone probes the USB tunnel every second and connects as
+soon as the Hub answers.
+
+- `No Wi-Fi - waiting for Hub over USB` is the normal status while the phone
+  has no Wi-Fi and the tunnel is not ready yet. It is not an error.
+- `USB tunnel open, Hub not answering - retrying` means the `adb reverse`
+  tunnel exists but no Hub is listening behind it, for example after the Hub
+  was closed. Start CaptureBridge Hub; the phone reconnects on its own.
+- If the Hub shows `USB unavailable: adb.exe not found`, it can only use Wi-Fi
+  discovery. Install Android SDK Platform-Tools or set
+  `phone_transport.adb_path` in the Hub configuration.
+
+Wi-Fi discovery keeps its own backoff of 1, 2, 4, then 8 seconds between
+attempts; the USB probe does not wait for that backoff.
+
 ### The camera settings do not apply
 
 - The requested resolution may not be supported by the phone.
 - Manual ISO or shutter control depends on the phone's Camera2 capabilities.
+- In high-speed modes such as `240 fps`, the shutter is fixed at about one
+  frame period and the phone matches the requested brightness with exposure
+  compensation (see [High Frame Rates and Exposure](#high-frame-rates-and-exposure)).
 - Stop recording before switching camera or changing settings.
 
 ### Live preview does not show in the Hub
