@@ -24,8 +24,6 @@ reference system. (B) Recordings are prepared and analyzed in external
 software. Those are intended uses, not validated integrations shipped with
 CaptureBridge.
 
-This is the same overview figure used in the CaptureBridge SoftwareX manuscript.
-
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
@@ -241,10 +239,8 @@ The phone client is a single screen. From top to bottom it shows:
   `Live Stream` (whether the Hub is pulling a preview stream). A `Transfer` row
   appears while files are being sent to the Hub.
 
-The Hub address is masked and the viewfinder content is a representative
-recording frame. The person shown consented to publication. The screenshot
-predates v1.0.16 and therefore does not show the version line. The matching
-Hub window is documented under
+The viewfinder shows a representative recording frame. The matching Hub window
+is documented under
 [CaptureBridge Hub - Interface Overview](https://github.com/USTP-Biomechanics/CaptureBridge-Hub#interface-overview).
 
 ## Operator Workflow
@@ -452,15 +448,12 @@ pre-arms the camera pipeline and returns phone-side receive/transmit timing
 fields on key command responses. The Hub also exchanges background `SYNC`
 samples and can use `START_AT` / `STOP_AT` for scheduled phone-clock segment
 marks when the sync estimate is usable. This helps inspect command timing and
-trim the saved MP4 around the requested segment, but this version does not claim
-measured frame-level synchronization. Studies that require frame-accurate timing
-should validate timing with an external optical or electronic reference.
-
-Repeated single-phone measurements of the saved recording boundaries against
-display-timed timecodes are published in the Hub repository's
-[validation directory](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/tree/main/validation);
-they do not establish alignment between phones or with a laboratory reference
-system.
+trim the saved MP4 around the requested segment. Repeated single-phone
+measurements of the saved recording boundaries against display-timed timecodes
+are published in the Hub repository's
+[validation directory](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/tree/main/validation).
+For frame-accurate alignment between phones or with a laboratory reference,
+verify timing with an external optical or electronic reference.
 
 ## Troubleshooting
 
