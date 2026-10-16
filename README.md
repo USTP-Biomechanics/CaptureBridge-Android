@@ -13,6 +13,19 @@ single-camera monocular analysis, multi-camera reconstruction, video-to-pose
 workflows, mesh-based pose estimation, or OpenSim-compatible
 inverse-kinematics pipelines.
 
+## System Overview
+
+![CaptureBridge system and research workflow](docs/images/capturebridge-overview.png)
+
+(A) The Windows Hub controls the Android recording clients over USB/ADB or a
+private Wi-Fi network and receives videos together with acquisition metadata.
+The optional Arduino bridge exchanges start and stop events with a laboratory
+reference system. (B) Recordings are prepared and analyzed in external
+software. Those are intended uses, not validated integrations shipped with
+CaptureBridge.
+
+This is the same overview figure used in the CaptureBridge SoftwareX manuscript.
+
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
@@ -30,11 +43,9 @@ Use these two versions together:
 - [CaptureBridge Hub v1.0.11](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.11)
 - [CaptureBridge Android v1.0.17](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.17)
 
-The release pair archived for the CaptureBridge SoftwareX submission is
-[CaptureBridge Hub v1.0.10](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.10) with
-[CaptureBridge Android v1.0.15](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.15); use that pair when
-reproducing the submitted software configuration. Future releases may change
-the protocol or installation instructions.
+This is also the release pair described in the CaptureBridge SoftwareX
+manuscript; use it when reproducing that software configuration. Future
+releases may change the protocol or installation instructions.
 
 ## Main Features
 
@@ -205,6 +216,37 @@ plugged source for the Hub UI. It is status telemetry, not a measurement of
 current, voltage, power, energy consumption, temperature, or battery health.
 The Hub does not persist these updates as a battery-measurement time series.
 
+## Interface Overview
+
+![CaptureBridge Android main screen](docs/images/android-main-screen.png)
+
+The phone client is a single screen. From top to bottom it shows:
+
+- **Header**: the app name, the `TCP camera recorder` subtitle with the app
+  version below it (from v1.0.16), and a connection indicator that turns green
+  and reads `Connected` once the control connection to the Hub is open.
+- **Camera selector**: the button names the camera the phone will switch *to*,
+  so a `Front Camera` button means the back camera is currently active. The Hub
+  reports the selected camera under its own `Camera Sync` label.
+- **Connect**: starts a connection attempt, trying USB/ADB reverse forwarding
+  first and falling back to UDP discovery of the Hub on the local network.
+- **Viewfinder**: the camera image as the phone currently sees it. Use it to
+  check framing and exposure before a trial.
+- **Status rows**: `Server` (Hub address, port, and connection state),
+  `Recording`, `Status` (the most recent Hub command or discovery message),
+  `Label` (the active capture name sent by the Hub), `Camera` (resolution,
+  frame rate, ISO, and shutter as applied by Camera2; above 60 fps, the fixed
+  shutter and the exposure compensation in use, see
+  [High Frame Rates and Exposure](#high-frame-rates-and-exposure)), and
+  `Live Stream` (whether the Hub is pulling a preview stream). A `Transfer` row
+  appears while files are being sent to the Hub.
+
+The Hub address is masked and the viewfinder content is a representative
+recording frame. The person shown consented to publication. The screenshot
+predates v1.0.16 and therefore does not show the version line. The matching
+Hub window is documented under
+[CaptureBridge Hub - Interface Overview](https://github.com/USTP-Biomechanics/CaptureBridge-Hub#interface-overview).
+
 ## Operator Workflow
 
 1. Connect Android phones by USB with USB debugging enabled, or put the Windows
@@ -233,7 +275,8 @@ The Android screen shows the app version (for example `v1.0.16`) under the
 active capture label, camera settings, and transfer state. In high-speed modes
 the camera line reads `<width>x<height> @ <fps> fps | shutter fixed | <EV> auto`,
 for example `1920x1080 @ 240 fps | shutter fixed | -2.0 EV auto`, instead of
-ISO and shutter values that the camera cannot apply there.
+ISO and shutter values that the camera cannot apply there. See
+[Interface Overview](#interface-overview).
 
 ## Network Protocol Summary
 
@@ -412,6 +455,12 @@ marks when the sync estimate is usable. This helps inspect command timing and
 trim the saved MP4 around the requested segment, but this version does not claim
 measured frame-level synchronization. Studies that require frame-accurate timing
 should validate timing with an external optical or electronic reference.
+
+Repeated single-phone measurements of the saved recording boundaries against
+display-timed timecodes are published in the Hub repository's
+[validation directory](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/tree/main/validation);
+they do not establish alignment between phones or with a laboratory reference
+system.
 
 ## Troubleshooting
 
