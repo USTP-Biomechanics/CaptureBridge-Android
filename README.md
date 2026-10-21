@@ -15,14 +15,22 @@ inverse-kinematics pipelines.
 
 ## System Overview
 
-![CaptureBridge system and research workflow](docs/images/capturebridge-overview.png)
+![CaptureBridge system overview, workflow, timing self-test, and results](docs/images/capturebridge-graphical-abstract.png)
 
-(A) The Windows Hub controls the Android recording clients over USB/ADB or a
+(1) The Windows Hub controls the Android recording clients over USB/ADB or a
 private Wi-Fi network and receives videos together with acquisition metadata.
 The optional Arduino bridge exchanges start and stop events with a laboratory
-reference system. (B) Recordings are prepared and analyzed in external
-software. Those are intended uses, not validated integrations shipped with
-CaptureBridge.
+reference system. (2) Each trial is configured in the Hub, distributed to the
+phones, started and stopped at scheduled times, and transferred to the PC.
+(3) The Hub's built-in
+[lag test](https://github.com/USTP-Biomechanics/CaptureBridge-Hub#lag-test)
+compares the time at which an ArUco timecode appeared on the PC display with
+the phone's timestamp of the frame that shows it. (4) Residuals of 1200 start
+and stop frames recorded with one Samsung Galaxy S25 Ultra, Hub v1.0.11, and
+Android v1.0.17; details are in the Hub's
+[validation directory](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/tree/main/validation).
+(5) The analysis tools named are intended uses, not validated integrations
+shipped with CaptureBridge.
 
 ## Companion Hub
 
