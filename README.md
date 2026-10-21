@@ -35,7 +35,7 @@ shipped with CaptureBridge.
 ## Companion Hub
 
 CaptureBridge Android is the phone-side companion to
-[CaptureBridge Hub v1.0.11](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.11),
+[CaptureBridge Hub v1.0.12](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.12),
 the Windows desktop controller and transfer host. For normal lab installs, the
 Hub release ZIP is downloaded separately from the Android phone client. Install
 `CaptureBridge-Android.apk` from the
@@ -46,7 +46,7 @@ use this Android repository when building or modifying the phone client.
 
 Use these two versions together:
 
-- [CaptureBridge Hub v1.0.11](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.11)
+- [CaptureBridge Hub v1.0.12](https://github.com/USTP-Biomechanics/CaptureBridge-Hub/releases/tag/v1.0.12)
 - [CaptureBridge Android v1.0.17](https://github.com/USTP-Biomechanics/CaptureBridge-Android/releases/tag/v1.0.17)
 
 This is also the release pair described in the CaptureBridge SoftwareX
